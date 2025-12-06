@@ -30,8 +30,8 @@ const bot = new Telegraf(BOT_TOKEN);
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: {
-    rejectUnauthorized: false
-  }
+    rejectUnauthorized: false,
+  },
 });
 
 // Express app
@@ -40,7 +40,7 @@ app.use(express.json());
 app.use(
   cors({
     origin: "*", // you can later lock this to your Netlify domain
-    methods: ["GET", "POST", "OPTIONS"]
+    methods: ["GET", "POST", "OPTIONS"],
   })
 );
 
@@ -112,7 +112,7 @@ async function initDb() {
       title: "Daily check-in",
       description: "Come back every 24h for a streak bonus.",
       reward: 200,
-      kind: "daily"
+      kind: "daily",
     },
     {
       code: "join_tg",
@@ -120,22 +120,22 @@ async function initDb() {
       description: "Join the official Airdrop Empire chat.",
       reward: 500,
       url: "https://t.me/YourEmpireChat",
-      kind: "once"
+      kind: "once",
     },
     {
       code: "invite_friend",
       title: "Invite a friend",
       description: "Invite your friends to build the Empire.",
       reward: 800,
-      kind: "invite"
+      kind: "invite",
     },
     {
       code: "pro_quest",
       title: "Pro quest",
       description: "Special partner missions. Coming soon.",
       reward: 1500,
-      kind: "special"
-    }
+      kind: "special",
+    },
   ];
 
   for (const t of coreTasks) {
@@ -159,10 +159,9 @@ async function initDb() {
 
 async function getOrCreateUser(tgUser, refCode) {
   const telegramId = String(tgUser.id);
-  let res = await pool.query(
-    "SELECT * FROM users WHERE telegram_id = $1",
-    [telegramId]
-  );
+  let res = await pool.query("SELECT * FROM users WHERE telegram_id = $1", [
+    telegramId,
+  ]);
 
   if (res.rows.length > 0) {
     return res.rows[0];
@@ -196,7 +195,7 @@ async function getOrCreateUser(tgUser, refCode) {
       tgUser.first_name || null,
       tgUser.last_name || null,
       inviteCode,
-      referredBy
+      referredBy,
     ]
   );
 
@@ -235,6 +234,31 @@ async function refreshDailyState(user) {
   return user;
 }
 
+// Build a standard response for the client (what index.html expects)
+function buildClientState(user, extra = {}) {
+  const balance = Number(user.balance) || 0;
+  const today = Number(user.today_farmed) || 0;
+  const energy = user.energy;
+
+  const invite_link = user.invite_code
+    ? `https://t.me/airdrop_empire_bot?start=${user.invite_code}`
+    : "https://t.me/airdrop_empire_bot?start=ref";
+
+  const referrals_count = extra.referrals_count ?? 0;
+  const referrals_points = extra.referrals_points ?? 0;
+
+  return {
+    ok: true,
+    balance,
+    energy,
+    today,
+    invite_link,
+    referrals_count,
+    referrals_points,
+    streak: user.streak || 0,
+  };
+}
+
 // ----------------- Telegram Bot Logic -----------------
 
 // /start handler with optional referral code
@@ -256,11 +280,11 @@ bot.start(async (ctx) => {
             [
               {
                 text: "🚀 Open Airdrop Empire",
-                web_app: { url: webAppUrl }
-              }
-            ]
-          ]
-        }
+                web_app: { url: webAppUrl },
+              },
+            ],
+          ],
+        },
       }
     );
   } catch (err) {
@@ -279,22 +303,20 @@ app.post("/api/state", async (req, res) => {
   try {
     const { user, ref } = req.body || {};
     if (!user || !user.id) {
-      return res.status(400).json({ error: "Missing Telegram user" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Missing Telegram user" });
     }
 
     let dbUser = await getOrCreateUser(user, ref || null);
     dbUser = await refreshDailyState(dbUser);
 
-    return res.json({
-      balance: Number(dbUser.balance) || 0,
-      energy: dbUser.energy,
-      todayFarmed: Number(dbUser.today_farmed) || 0,
-      inviteCode: dbUser.invite_code,
-      streak: dbUser.streak || 0
-    });
+    const clientState = buildClientState(dbUser);
+
+    return res.json(clientState);
   } catch (err) {
     console.error("/api/state error:", err);
-    return res.status(500).json({ error: "Server error" });
+    return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
@@ -303,22 +325,23 @@ app.post("/api/tap", async (req, res) => {
   try {
     const { user } = req.body || {};
     if (!user || !user.id) {
-      return res.status(400).json({ error: "Missing Telegram user" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Missing Telegram user" });
     }
 
     let dbUser = await getOrCreateUser(user);
     dbUser = await refreshDailyState(dbUser);
 
     if (dbUser.energy <= 0) {
-      return res.status(400).json({ error: "No energy left" });
+      return res.status(400).json({ ok: false, error: "No energy left" });
     }
 
-    // Simple anti-spam: max 20 taps per 5 seconds
+    // Simple anti-spam: 1 tap per 200ms
     const now = new Date();
     const lastTap = dbUser.last_tap_at ? new Date(dbUser.last_tap_at) : null;
     if (lastTap && now - lastTap < 200) {
-      // 1 tap per 200ms minimum
-      return res.status(429).json({ error: "Slow down" });
+      return res.status(429).json({ ok: false, error: "Slow down" });
     }
 
     const perTap = 1;
@@ -339,60 +362,51 @@ app.post("/api/tap", async (req, res) => {
     );
 
     const updated = updateRes.rows[0];
+    const clientState = buildClientState(updated);
 
-    return res.json({
-      balance: Number(updated.balance) || 0,
-      energy: updated.energy,
-      todayFarmed: Number(updated.today_farmed) || 0
-    });
+    return res.json(clientState);
   } catch (err) {
     console.error("/api/tap error:", err);
-    return res.status(500).json({ error: "Server error" });
+    return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
-// Claim task reward
-app.post("/api/task-claim", async (req, res) => {
-  try {
-    const { user, taskCode } = req.body || {};
-    if (!user || !user.id || !taskCode) {
-      return res.status(400).json({ error: "Missing data" });
+// Helper to process task claiming
+async function handleTaskClaim(user, taskCode) {
+  let dbUser = await getOrCreateUser(user);
+  dbUser = await refreshDailyState(dbUser);
+
+  const tRes = await pool.query(
+    "SELECT * FROM tasks WHERE code = $1 AND active = TRUE",
+    [taskCode]
+  );
+  if (tRes.rows.length === 0) {
+    return { ok: false, status: 400, error: "Unknown task" };
+  }
+  const task = tRes.rows[0];
+
+  // Daily task special rules
+  if (task.code === "daily") {
+    const lastDaily = dbUser.last_daily ? new Date(dbUser.last_daily) : null;
+    const today = new Date();
+    if (lastDaily && sameDay(lastDaily, today)) {
+      return { ok: false, status: 400, error: "Daily reward already claimed" };
     }
 
-    let dbUser = await getOrCreateUser(user);
-    dbUser = await refreshDailyState(dbUser);
-
-    const tRes = await pool.query(
-      "SELECT * FROM tasks WHERE code = $1 AND active = TRUE",
-      [taskCode]
-    );
-    if (tRes.rows.length === 0) {
-      return res.status(400).json({ error: "Unknown task" });
+    // Streak logic
+    let newStreak = dbUser.streak || 0;
+    if (lastDaily && sameDay(new Date(lastDaily.getTime() + 86400000), today)) {
+      newStreak += 1;
+    } else if (!lastDaily) {
+      newStreak = 1;
+    } else if (!sameDay(lastDaily, today)) {
+      newStreak = 1; // reset
     }
-    const task = tRes.rows[0];
 
-    // Daily task special rules
-    if (task.code === "daily") {
-      const lastDaily = dbUser.last_daily ? new Date(dbUser.last_daily) : null;
-      const today = new Date();
-      if (lastDaily && sameDay(lastDaily, today)) {
-        return res.status(400).json({ error: "Daily reward already claimed" });
-      }
+    const reward = task.reward + newStreak * 10; // small streak bonus
 
-      // Streak logic
-      let newStreak = dbUser.streak || 0;
-      if (lastDaily && sameDay(new Date(lastDaily.getTime() + 86400000), today)) {
-        newStreak += 1;
-      } else if (!lastDaily) {
-        newStreak = 1;
-      } else if (!sameDay(lastDaily, today)) {
-        newStreak = 1; // reset
-      }
-
-      const reward = task.reward + newStreak * 10; // small streak bonus
-
-      const upd = await pool.query(
-        `
+    const upd = await pool.query(
+      `
         UPDATE users
         SET balance = balance + $1,
             today_farmed = today_farmed + $1,
@@ -402,39 +416,35 @@ app.post("/api/task-claim", async (req, res) => {
         WHERE id = $3
         RETURNING *;
       `,
-        [reward, newStreak, dbUser.id]
-      );
+      [reward, newStreak, dbUser.id]
+    );
 
-      await pool.query(
-        `
+    await pool.query(
+      `
         INSERT INTO user_tasks (user_id, task_id, status)
         VALUES ($1,$2,'claimed')
         ON CONFLICT (user_id, task_id) DO UPDATE
         SET status = 'claimed', claimed_at = NOW();
       `,
-        [dbUser.id, task.id]
-      );
-
-      const u = upd.rows[0];
-      return res.json({
-        balance: Number(u.balance) || 0,
-        todayFarmed: Number(u.today_farmed) || 0,
-        streak: u.streak,
-        reward
-      });
-    }
-
-    // Non-daily tasks: only once
-    const utRes = await pool.query(
-      "SELECT * FROM user_tasks WHERE user_id = $1 AND task_id = $2",
       [dbUser.id, task.id]
     );
-    if (utRes.rows.length > 0) {
-      return res.status(400).json({ error: "Task already claimed" });
-    }
 
-    const upd = await pool.query(
-      `
+    const u = upd.rows[0];
+    const clientState = buildClientState(u);
+    return { ok: true, payload: { ...clientState, reward } };
+  }
+
+  // Non-daily tasks: only once
+  const utRes = await pool.query(
+    "SELECT * FROM user_tasks WHERE user_id = $1 AND task_id = $2",
+    [dbUser.id, task.id]
+  );
+  if (utRes.rows.length > 0) {
+    return { ok: false, status: 400, error: "Task already claimed" };
+  }
+
+  const upd = await pool.query(
+    `
       UPDATE users
       SET balance = balance + $1,
           today_farmed = today_farmed + $1,
@@ -442,27 +452,57 @@ app.post("/api/task-claim", async (req, res) => {
       WHERE id = $2
       RETURNING *;
     `,
-      [task.reward, dbUser.id]
-    );
+    [task.reward, dbUser.id]
+  );
 
-    await pool.query(
-      `
+  await pool.query(
+    `
       INSERT INTO user_tasks (user_id, task_id, status)
       VALUES ($1,$2,'claimed');
     `,
-      [dbUser.id, task.id]
-    );
+    [dbUser.id, task.id]
+  );
 
-    const u = upd.rows[0];
+  const u = upd.rows[0];
+  const clientState = buildClientState(u);
+  return { ok: true, payload: { ...clientState, reward: task.reward } };
+}
 
-    return res.json({
-      balance: Number(u.balance) || 0,
-      todayFarmed: Number(u.today_farmed) || 0,
-      reward: task.reward
-    });
+// Frontend uses /api/task, so we expose that
+app.post("/api/task", async (req, res) => {
+  try {
+    const { user, code } = req.body || {};
+    if (!user || !user.id || !code) {
+      return res.status(400).json({ ok: false, error: "Missing data" });
+    }
+
+    const result = await handleTaskClaim(user, code);
+    if (!result.ok) {
+      return res.status(result.status || 400).json(result);
+    }
+    return res.json({ ok: true, ...result.payload });
+  } catch (err) {
+    console.error("/api/task error:", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// Legacy endpoint if needed
+app.post("/api/task-claim", async (req, res) => {
+  try {
+    const { user, taskCode } = req.body || {};
+    if (!user || !user.id || !taskCode) {
+      return res.status(400).json({ ok: false, error: "Missing data" });
+    }
+
+    const result = await handleTaskClaim(user, taskCode);
+    if (!result.ok) {
+      return res.status(result.status || 400).json(result);
+    }
+    return res.json({ ok: true, ...result.payload });
   } catch (err) {
     console.error("/api/task-claim error:", err);
-    return res.status(500).json({ error: "Server error" });
+    return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
@@ -471,18 +511,20 @@ app.post("/api/withdraw", async (req, res) => {
   try {
     const { user, amount, address } = req.body || {};
     if (!user || !user.id || !amount || !address) {
-      return res.status(400).json({ error: "Missing data" });
+      return res.status(400).json({ ok: false, error: "Missing data" });
     }
     const amt = parseInt(amount, 10);
     if (isNaN(amt) || amt <= 0) {
-      return res.status(400).json({ error: "Invalid amount" });
+      return res.status(400).json({ ok: false, error: "Invalid amount" });
     }
 
     let dbUser = await getOrCreateUser(user);
     dbUser = await refreshDailyState(dbUser);
 
     if (Number(dbUser.balance) < amt) {
-      return res.status(400).json({ error: "Not enough balance" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Not enough balance" });
     }
 
     // Deduct immediately and log request
@@ -508,12 +550,57 @@ app.post("/api/withdraw", async (req, res) => {
     const u = upd.rows[0];
 
     return res.json({
+      ok: true,
       balance: Number(u.balance) || 0,
-      message: "Withdraw request submitted. You will be paid manually."
+      message: "Withdraw request submitted. You will be paid manually.",
     });
   } catch (err) {
     console.error("/api/withdraw error:", err);
-    return res.status(500).json({ error: "Server error" });
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// Extra endpoints used by frontend to refresh info in different tabs
+
+app.post("/api/friends", async (req, res) => {
+  try {
+    const { user } = req.body || {};
+    if (!user || !user.id) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Missing Telegram user" });
+    }
+
+    let dbUser = await getOrCreateUser(user);
+    dbUser = await refreshDailyState(dbUser);
+
+    // TODO: real referral stats
+    const clientState = buildClientState(dbUser);
+    return res.json(clientState);
+  } catch (err) {
+    console.error("/api/friends error:", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+app.post("/api/withdraw/info", async (req, res) => {
+  try {
+    const { user } = req.body || {};
+    if (!user || !user.id) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Missing Telegram user" });
+    }
+
+    let dbUser = await getOrCreateUser(user);
+    dbUser = await refreshDailyState(dbUser);
+
+    const clientState = buildClientState(dbUser);
+    // later we can add min withdraw, token rates, etc. into extra fields
+    return res.json(clientState);
+  } catch (err) {
+    console.error("/api/withdraw/info error:", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
