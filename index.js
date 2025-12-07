@@ -416,33 +416,107 @@ app.post("/api/task", telegramAuthMiddleware, async (req, res) => {
     dbUser = await refreshDailyState(dbUser);
 
     const reward = TASK_REWARDS[code] || 0;
-
-    if (reward > 0) {
-      const upd = await pool.query(
-        `
-          UPDATE users
-          SET balance = balance + $1,
-              today_farmed = today_farmed + $1,
-              updated_at = NOW()
-          WHERE id = $2
-          RETURNING *;
-        `,
-        [reward, dbUser.id]
-      );
-      dbUser = upd.rows[0];
-      console.log(
-        "/api/task",
-        code,
-        "reward",
-        reward,
-        "user",
-        dbUser.telegram_id
-      );
-    } else {
+    if (!reward) {
       console.log("/api/task unknown code", code, "for user", dbUser.telegram_id);
+      const clientState = buildClientState(dbUser);
+      return res.json(clientState);
     }
 
-    const clientState = buildClientState(dbUser);
+    let updatedUser = dbUser;
+
+    if (code === "daily") {
+      // Server-side protection: only once per calendar day
+      const today = todayDate();
+      let lastDailyStr = null;
+
+      if (dbUser.last_daily instanceof Date) {
+        lastDailyStr = dbUser.last_daily.toISOString().slice(0, 10);
+      } else if (typeof dbUser.last_daily === "string") {
+        lastDailyStr = dbUser.last_daily;
+      }
+
+      if (lastDailyStr === today) {
+        console.log("/api/task daily already claimed for user", dbUser.telegram_id);
+      } else {
+        const upd = await pool.query(
+          `
+            UPDATE users
+            SET balance = balance + $1,
+                today_farmed = today_farmed + $1,
+                last_daily = $2,
+                updated_at = NOW()
+            WHERE id = $3
+            RETURNING *;
+          `,
+          [reward, today, dbUser.id]
+        );
+        updatedUser = upd.rows[0];
+        console.log(
+          "/api/task daily reward",
+          reward,
+          "user",
+          updatedUser.telegram_id
+        );
+      }
+    } else {
+      // One-time tasks (join_tg, invite_friend) using tasks + user_tasks
+      const taskRes = await pool.query(
+        `
+          INSERT INTO tasks (code, title, reward)
+          VALUES ($1, $2, $3)
+          ON CONFLICT (code) DO UPDATE
+          SET reward = EXCLUDED.reward
+          RETURNING id;
+        `,
+        [code, code, reward]
+      );
+      const taskId = taskRes.rows[0].id;
+
+      const existing = await pool.query(
+        `
+          SELECT id FROM user_tasks
+          WHERE user_id = $1 AND task_id = $2;
+        `,
+        [dbUser.id, taskId]
+      );
+
+      if (existing.rows.length > 0) {
+        console.log(
+          "/api/task",
+          code,
+          "already completed for user",
+          dbUser.telegram_id
+        );
+      } else {
+        const upd = await pool.query(
+          `
+            WITH ins AS (
+              INSERT INTO user_tasks (user_id, task_id, status, completed_at)
+              VALUES ($1, $2, 'completed', NOW())
+              RETURNING id
+            )
+            UPDATE users
+            SET balance = balance + $3,
+                today_farmed = today_farmed + $3,
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING *;
+          `,
+          [dbUser.id, taskId, reward]
+        );
+        updatedUser = upd.rows[0];
+        console.log(
+          "/api/task",
+          code,
+          "reward",
+          reward,
+          "user",
+          updatedUser.telegram_id
+        );
+      }
+    }
+
+    const clientState = buildClientState(updatedUser);
     return res.json(clientState);
   } catch (err) {
     console.error("/api/task error:", err);
