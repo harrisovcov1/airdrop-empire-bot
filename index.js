@@ -9,6 +9,7 @@ const express = require("express");
 const cors = require("cors");
 const { Telegraf } = require("telegraf");
 const { Pool } = require("pg");
+const crypto = require("crypto");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -21,6 +22,131 @@ if (!BOT_TOKEN) {
 if (!DATABASE_URL) {
   console.error("❌ DATABASE_URL is missing in environment variables");
   process.exit(1);
+}
+
+// ----------------- Telegram WebApp initData Verification -----------------
+
+/**
+ * Extract initData sent from the Telegram WebApp.
+ * Supported sources:
+ *  - Header: x-telegram-init-data
+ *  - Body:   req.body.initData
+ *  - Query:  ?initData=...
+ */
+function getInitDataFromRequest(req) {
+  return (
+    req.headers["x-telegram-init-data"] ||
+    (req.body && req.body.initData) ||
+    (req.query && req.query.initData) ||
+    null
+  );
+}
+
+/**
+ * Verify Telegram WebApp initData according to official docs:
+ *   - Remove `hash` from the data.
+ *   - Sort remaining "key=value" pairs alphabetically.
+ *   - Join by '\n'.
+ *   - HMAC-SHA256(dataCheckString, secretKey), where:
+ *       secretKey = SHA256(BOT_TOKEN)
+ *   - Compare result (hex) with `hash`.
+ *   - Check `auth_date` has not expired.
+ */
+function verifyTelegramInitData(botToken, initData) {
+  if (!initData || typeof initData !== "string") {
+    throw new Error("Missing Telegram initData");
+  }
+
+  const params = new URLSearchParams(initData);
+
+  const hash = params.get("hash");
+  if (!hash) {
+    throw new Error("Missing hash in initData");
+  }
+  params.delete("hash");
+
+  // Build data_check_string
+  const entries = Array.from(params.entries()).sort(([a], [b]) =>
+    a.localeCompare(b)
+  );
+  const dataCheckArr = [];
+  for (const [key, value] of entries) {
+    dataCheckArr.push(`${key}=${value}`);
+  }
+  const dataCheckString = dataCheckArr.join("\n");
+
+  // secret_key = SHA256(bot_token)
+  const secretKey = crypto.createHash("sha256").update(botToken).digest();
+
+  // HMAC-SHA256(data_check_string, secret_key)
+  const hmac = crypto
+    .createHmac("sha256", secretKey)
+    .update(dataCheckString)
+    .digest("hex");
+
+  if (hmac !== hash) {
+    throw new Error("Invalid Telegram initData hash");
+  }
+
+  // Basic freshness check on auth_date (optional but recommended)
+  const authDateStr = params.get("auth_date");
+  if (authDateStr) {
+    const authDate = parseInt(authDateStr, 10);
+    const now = Math.floor(Date.now() / 1000);
+    const maxAgeSeconds = 60 * 60 * 24; // 24 hours
+    if (now - authDate > maxAgeSeconds) {
+      throw new Error("Telegram initData expired");
+    }
+  }
+
+  // Parse user object if present
+  let user = null;
+  const userJson = params.get("user");
+  if (userJson) {
+    try {
+      user = JSON.parse(userJson);
+    } catch (e) {
+      console.warn("Failed to parse Telegram user JSON:", e.message);
+    }
+  }
+
+  return {
+    user,
+    params,
+    rawObject: Object.fromEntries(params.entries()),
+  };
+}
+
+/**
+ * Express middleware to enforce Telegram WebApp auth on selected routes.
+ * - Verifies initData using BOT_TOKEN
+ * - Attaches `req.telegram.user` etc.
+ */
+function telegramAuthMiddleware(req, res, next) {
+  try {
+    const initData = getInitDataFromRequest(req);
+    const verified = verifyTelegramInitData(BOT_TOKEN, initData);
+
+    req.telegram = {
+      initData,
+      user: verified.user,
+      data: verified.rawObject,
+    };
+
+    // Optional convenience
+    if (verified.user) {
+      req.user = verified.user;
+    }
+
+    next();
+  } catch (err) {
+    console.error("❌ Telegram WebApp auth failed:", err.message);
+    return res.status(401).json({
+      ok: false,
+      error: "TELEGRAM_AUTH_FAILED",
+      message: err.message,
+    });
+  }
 }
 
 // Telegram bot
@@ -299,16 +425,18 @@ console.log("🤖 Telegram bot is running...");
 // ----------------- Express API for Mini App -----------------
 
 // Get current user state
-app.post("/api/state", async (req, res) => {
+app.post("/api/state", telegramAuthMiddleware, async (req, res) => {
   try {
-    const { user, ref } = req.body || {};
-    if (!user || !user.id) {
+    const tgUser = req.telegram?.user;
+    const { ref } = req.body || {};
+
+    if (!tgUser || !tgUser.id) {
       return res
         .status(400)
         .json({ ok: false, error: "Missing Telegram user" });
     }
 
-    let dbUser = await getOrCreateUser(user, ref || null);
+    let dbUser = await getOrCreateUser(tgUser, ref || null);
     dbUser = await refreshDailyState(dbUser);
 
     const clientState = buildClientState(dbUser);
@@ -321,16 +449,16 @@ app.post("/api/state", async (req, res) => {
 });
 
 // Tap to earn
-app.post("/api/tap", async (req, res) => {
+app.post("/api/tap", telegramAuthMiddleware, async (req, res) => {
   try {
-    const { user } = req.body || {};
-    if (!user || !user.id) {
+    const tgUser = req.telegram?.user;
+    if (!tgUser || !tgUser.id) {
       return res
         .status(400)
         .json({ ok: false, error: "Missing Telegram user" });
     }
 
-    let dbUser = await getOrCreateUser(user);
+    let dbUser = await getOrCreateUser(tgUser);
     dbUser = await refreshDailyState(dbUser);
 
     if (dbUser.energy <= 0) {
@@ -469,14 +597,16 @@ async function handleTaskClaim(user, taskCode) {
 }
 
 // Frontend uses /api/task, so we expose that
-app.post("/api/task", async (req, res) => {
+app.post("/api/task", telegramAuthMiddleware, async (req, res) => {
   try {
-    const { user, code } = req.body || {};
-    if (!user || !user.id || !code) {
+    const tgUser = req.telegram?.user;
+    const { code } = req.body || {};
+
+    if (!tgUser || !tgUser.id || !code) {
       return res.status(400).json({ ok: false, error: "Missing data" });
     }
 
-    const result = await handleTaskClaim(user, code);
+    const result = await handleTaskClaim(tgUser, code);
     if (!result.ok) {
       return res.status(result.status || 400).json(result);
     }
@@ -488,14 +618,16 @@ app.post("/api/task", async (req, res) => {
 });
 
 // Legacy endpoint if needed
-app.post("/api/task-claim", async (req, res) => {
+app.post("/api/task-claim", telegramAuthMiddleware, async (req, res) => {
   try {
-    const { user, taskCode } = req.body || {};
-    if (!user || !user.id || !taskCode) {
+    const tgUser = req.telegram?.user;
+    const { taskCode } = req.body || {};
+
+    if (!tgUser || !tgUser.id || !taskCode) {
       return res.status(400).json({ ok: false, error: "Missing data" });
     }
 
-    const result = await handleTaskClaim(user, taskCode);
+    const result = await handleTaskClaim(tgUser, taskCode);
     if (!result.ok) {
       return res.status(result.status || 400).json(result);
     }
@@ -507,10 +639,12 @@ app.post("/api/task-claim", async (req, res) => {
 });
 
 // Submit withdraw request
-app.post("/api/withdraw", async (req, res) => {
+app.post("/api/withdraw", telegramAuthMiddleware, async (req, res) => {
   try {
-    const { user, amount, address } = req.body || {};
-    if (!user || !user.id || !amount || !address) {
+    const tgUser = req.telegram?.user;
+    const { amount, address } = req.body || {};
+
+    if (!tgUser || !tgUser.id || !amount || !address) {
       return res.status(400).json({ ok: false, error: "Missing data" });
     }
     const amt = parseInt(amount, 10);
@@ -518,7 +652,7 @@ app.post("/api/withdraw", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Invalid amount" });
     }
 
-    let dbUser = await getOrCreateUser(user);
+    let dbUser = await getOrCreateUser(tgUser);
     dbUser = await refreshDailyState(dbUser);
 
     if (Number(dbUser.balance) < amt) {
@@ -562,16 +696,16 @@ app.post("/api/withdraw", async (req, res) => {
 
 // Extra endpoints used by frontend to refresh info in different tabs
 
-app.post("/api/friends", async (req, res) => {
+app.post("/api/friends", telegramAuthMiddleware, async (req, res) => {
   try {
-    const { user } = req.body || {};
-    if (!user || !user.id) {
+    const tgUser = req.telegram?.user;
+    if (!tgUser || !tgUser.id) {
       return res
         .status(400)
         .json({ ok: false, error: "Missing Telegram user" });
     }
 
-    let dbUser = await getOrCreateUser(user);
+    let dbUser = await getOrCreateUser(tgUser);
     dbUser = await refreshDailyState(dbUser);
 
     // TODO: real referral stats
@@ -583,26 +717,30 @@ app.post("/api/friends", async (req, res) => {
   }
 });
 
-app.post("/api/withdraw/info", async (req, res) => {
-  try {
-    const { user } = req.body || {};
-    if (!user || !user.id) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Missing Telegram user" });
+app.post(
+  "/api/withdraw/info",
+  telegramAuthMiddleware,
+  async (req, res) => {
+    try {
+      const tgUser = req.telegram?.user;
+      if (!tgUser || !tgUser.id) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "Missing Telegram user" });
+      }
+
+      let dbUser = await getOrCreateUser(tgUser);
+      dbUser = await refreshDailyState(dbUser);
+
+      const clientState = buildClientState(dbUser);
+      // later we can add min withdraw, token rates, etc. into extra fields
+      return res.json(clientState);
+    } catch (err) {
+      console.error("/api/withdraw/info error:", err);
+      return res.status(500).json({ ok: false, error: "Server error" });
     }
-
-    let dbUser = await getOrCreateUser(user);
-    dbUser = await refreshDailyState(dbUser);
-
-    const clientState = buildClientState(dbUser);
-    // later we can add min withdraw, token rates, etc. into extra fields
-    return res.json(clientState);
-  } catch (err) {
-    console.error("/api/withdraw/info error:", err);
-    return res.status(500).json({ ok: false, error: "Server error" });
   }
-});
+);
 
 // Simple admin endpoint (you can secure later with a secret)
 app.get("/api/admin/withdraws", async (req, res) => {
