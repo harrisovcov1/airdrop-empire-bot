@@ -373,7 +373,6 @@ bot.start(async (ctx) => {
     user = await refreshDailyState(user);
 
     const webAppUrl = "https://resilient-kheer-041b8c.netlify.app";
-";
 
     await ctx.reply(
       "🔥 Welcome to Airdrop Empire!\nTap below to open the game 👇",
