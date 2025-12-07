@@ -16,11 +16,15 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN is missing in environment variables");
+  console.error("Make sure BOT_TOKEN is set on Render and restart the service.");
   process.exit(1);
 }
 
 if (!DATABASE_URL) {
   console.error("❌ DATABASE_URL is missing in environment variables");
+  console.error(
+    "Make sure DATABASE_URL (Supabase connection string) is set on Render and restart the service."
+  );
   process.exit(1);
 }
 
@@ -392,6 +396,33 @@ bot.start(async (ctx) => {
   } catch (err) {
     console.error("Error in /start:", err);
     await ctx.reply("Something went wrong. Please try again in a moment.");
+  }
+});
+
+// /tap command – tell the user to open the mini app instead of showing an error
+bot.command("tap", async (ctx) => {
+  try {
+    const webAppUrl = "https://peppy-lebkuchen-336af3.netlify.app";
+
+    await ctx.reply(
+      "⚡ All tapping happens inside the Airdrop Empire mini app.\n\n" +
+        "Tap the blue **Airdrop Empire** bar above, or use the button below to open it 👇",
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "🚀 Open Airdrop Empire",
+                web_app: { url: webAppUrl },
+              },
+            ],
+          ],
+        },
+      }
+    );
+  } catch (err) {
+    console.error("Error in /tap:", err);
+    await ctx.reply("Please tap the Airdrop Empire button above to open the game.");
   }
 });
 
