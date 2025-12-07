@@ -354,7 +354,12 @@ app.post("/api/tap", telegramAuthMiddleware, async (req, res) => {
     let dbUser = await getOrCreateUser(tgUser);
     dbUser = await refreshDailyState(dbUser);
 
-    if (dbUser.energy <= 0) {
+    // Ensure numeric values (BIGINT comes back as string)
+    const currentEnergy = Number(dbUser.energy || 0);
+    const currentBalance = Number(dbUser.balance || 0);
+    const currentTodayFarmed = Number(dbUser.today_farmed || 0);
+
+    if (currentEnergy <= 0) {
       console.log("/api/tap: no energy for user", dbUser.telegram_id);
       const clientState = buildClientState(dbUser);
       clientState.error = "NO_ENERGY";
@@ -362,9 +367,9 @@ app.post("/api/tap", telegramAuthMiddleware, async (req, res) => {
     }
 
     const perTap = 1; // +1 per tap for now
-    const newEnergy = dbUser.energy - 1;
-    const newBalance = (dbUser.balance || 0) + perTap;
-    const newToday = (dbUser.today_farmed || 0) + perTap;
+    const newEnergy = currentEnergy - 1;
+    const newBalance = currentBalance + perTap;
+    const newToday = currentTodayFarmed + perTap;
 
     const updateRes = await pool.query(
       `
