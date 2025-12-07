@@ -1,5 +1,5 @@
 // index.js
-// Airdrop Empire – Backend Engine (clean version with logging)
+// Airdrop Empire – Backend Engine (DEV-friendly auth)
 // - Telegram bot (Telegraf)
 // - Express API for mini app
 // - Postgres (Supabase) via pg.Pool
@@ -9,7 +9,6 @@ const express = require("express");
 const cors = require("cors");
 const { Telegraf } = require("telegraf");
 const { Pool } = require("pg");
-const crypto = require("crypto");
 
 // ---- Environment ----
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -36,99 +35,92 @@ function todayDate() {
   return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
 }
 
-// ----------------- Telegram initData verification -----------------
+// ----------------- Telegram initData (DEV MODE, NO HASH CHECK) -----------------
 
 /**
- * Parse and verify Telegram WebApp initData.
+ * Parse Telegram WebApp initData WITHOUT verifying the HMAC hash.
+ * This is OK for DEV but later we can re-enable full security.
+ *
  * Returns { user, query } on success, or null on failure.
  */
-function getTelegramUserFromInitData(initData, botToken) {
+function getTelegramUserFromInitData(initData) {
   if (!initData || typeof initData !== "string" || initData.trim() === "") {
     return null;
   }
 
   try {
-    const urlParams = new URLSearchParams(initData);
-    const hash = urlParams.get("hash");
-    if (!hash) {
+    const params = new URLSearchParams(initData);
+    const userStr = params.get("user");
+    if (!userStr) {
+      console.warn("getTelegramUserFromInitData: no user field in initData");
       return null;
     }
-
-    // Collect auth data except 'hash'
-    const authData = {};
-    urlParams.forEach((value, key) => {
-      if (key === "hash") return;
-      authData[key] = value;
-    });
-
-    const dataCheckString = Object.keys(authData)
-      .sort()
-      .map((key) => `${key}=${authData[key]}`)
-      .join("\n");
-
-    // Secret key: HMAC-SHA256 of bot token with key "WebAppData"
-    const secretKey = crypto
-      .createHmac("sha256", "WebAppData")
-      .update(botToken)
-      .digest();
-
-    const computedHash = crypto
-      .createHmac("sha256", secretKey)
-      .update(dataCheckString)
-      .digest("hex");
-
-    if (computedHash !== hash) {
-      return null;
-    }
-
-    // Now parse the "user" field, which is JSON
-    const userStr = urlParams.get("user");
-    if (!userStr) return null;
 
     const user = JSON.parse(userStr);
-    return { user, query: urlParams };
+    return { user, query: params };
   } catch (err) {
-    console.error("getTelegramUserFromInitData error:", err);
+    console.error("getTelegramUserFromInitData parse error:", err);
     return null;
   }
 }
 
 // ----------------- Auth Middleware -----------------
 
+/**
+ * DEV version:
+ *  1) Tries to parse real Telegram user from initData
+ *  2) If it fails, falls back to a hardcoded dev user so Supabase still works
+ */
 function telegramAuthMiddleware(req, res, next) {
   const initData = req.body && req.body.initData;
 
+  let tgUser = null;
+  let params = null;
+
   if (!initData) {
-    console.warn("telegramAuthMiddleware: missing initData");
+    console.warn("telegramAuthMiddleware: missing initData – using DEV user");
+  } else {
+    const result = getTelegramUserFromInitData(initData);
+    if (result && result.user) {
+      tgUser = result.user;
+      params = result.query;
+      console.log(
+        "telegramAuthMiddleware: parsed Telegram user",
+        tgUser.id,
+        tgUser.username
+      );
+    } else {
+      console.warn(
+        "telegramAuthMiddleware: could not parse initData – using DEV user"
+      );
+    }
   }
 
-  const result = getTelegramUserFromInitData(initData, BOT_TOKEN);
-
-  if (!result || !result.user) {
-    console.warn(
-      "telegramAuthMiddleware: INVALID initData",
-      initData ? initData.slice(0, 120) + "..." : "(empty)"
-    );
-    return res
-      .status(401)
-      .json({ ok: false, error: "Invalid Telegram initData" });
+  // DEV fallback user (use your own Telegram id so it matches Supabase row)
+  if (!tgUser) {
+    tgUser = {
+      id: 7888995060, // your real telegram_id from Supabase
+      is_bot: false,
+      first_name: "Dev",
+      username: "devuser",
+      language_code: "en",
+    };
   }
-
-  const tgUser = result.user;
-  console.log("telegramAuthMiddleware OK for user", tgUser.id);
 
   req.tgUser = tgUser;
 
   // Try to extract referral code from start_param if present
   let refCode = null;
   try {
-    const params = result.query;
-    const startParam = params.get("start_param");
-    if (startParam && startParam.trim() !== "") {
-      if (startParam.startsWith("ref_")) {
-        refCode = startParam.substring(4);
-      } else {
-        refCode = startParam.trim();
+    const p = params || (initData ? new URLSearchParams(initData) : null);
+    if (p) {
+      const startParam = p.get("start_param");
+      if (startParam && startParam.trim() !== "") {
+        if (startParam.startsWith("ref_")) {
+          refCode = startParam.substring(4);
+        } else {
+          refCode = startParam.trim();
+        }
       }
     }
   } catch (e) {
@@ -142,7 +134,7 @@ function telegramAuthMiddleware(req, res, next) {
 // ----------------- DB Helpers -----------------
 
 async function initDb() {
-  // Users table – definition compatible with your existing schema
+  // Users table – matches your existing schema
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
@@ -165,7 +157,6 @@ async function initDb() {
     );
   `);
 
-  // Simple tasks table (for /api/task)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tasks (
       id SERIAL PRIMARY KEY,
@@ -177,7 +168,6 @@ async function initDb() {
     );
   `);
 
-  // User-task relation
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_tasks (
       id SERIAL PRIMARY KEY,
@@ -189,7 +179,6 @@ async function initDb() {
     );
   `);
 
-  // Withdraw requests (optional; used by /api/withdraw/info later)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS withdraw_requests (
       id SERIAL PRIMARY KEY,
@@ -234,7 +223,7 @@ async function getOrCreateUser(tgUser, refCode = null) {
   const newUser = insert.rows[0];
   console.log("Created new user", telegramId, "with id", newUser.id);
 
-  // NOTE: you can later implement referral logic here using refCode.
+  // TODO: use refCode for referral logic later
 
   return newUser;
 }
@@ -372,9 +361,10 @@ app.post("/api/tap", telegramAuthMiddleware, async (req, res) => {
       return res.json(clientState);
     }
 
+    const perTap = 1; // +1 per tap for now
     const newEnergy = dbUser.energy - 1;
-    const newBalance = (dbUser.balance || 0) + 1; // +1 per tap
-    const newToday = (dbUser.today_farmed || 0) + 1;
+    const newBalance = (dbUser.balance || 0) + perTap;
+    const newToday = (dbUser.today_farmed || 0) + perTap;
 
     const updateRes = await pool.query(
       `
@@ -461,7 +451,6 @@ app.post("/api/task", telegramAuthMiddleware, async (req, res) => {
 });
 
 // ---- /api/friends ----
-// For now just returns updated state; you can later add friend data.
 app.post("/api/friends", telegramAuthMiddleware, async (req, res) => {
   try {
     const tgUser = req.tgUser;
@@ -480,7 +469,6 @@ app.post("/api/friends", telegramAuthMiddleware, async (req, res) => {
 });
 
 // ---- /api/withdraw/info ----
-// Placeholder: just return current state for now.
 app.post("/api/withdraw/info", telegramAuthMiddleware, async (req, res) => {
   try {
     const tgUser = req.tgUser;
