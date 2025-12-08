@@ -1,16 +1,14 @@
 // index.js
-// Airdrop Empire – Backend Engine (DEV-friendly auth)
-// - Telegram bot (Telegraf)
-// - Express API for mini app
-// - Postgres (Supabase-style) via pg.Pool
+// Airdrop Empire – Backend Engine (leaderboards + referrals + tasks)
+//
+// Stack: Express API + Telegraf bot + Postgres (Supabase-style via pg.Pool)
 
-// ----------------- Imports & Setup -----------------
 const express = require("express");
 const cors = require("cors");
 const { Telegraf } = require("telegraf");
 const { Pool } = require("pg");
 
-// ---- Environment ----
+// ------------ Environment ------------
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const BOT_USERNAME = process.env.BOT_USERNAME || "AirdropEmpireAppBot";
@@ -24,7 +22,7 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-// ---- DB Pool ----
+// ------------ DB Pool ------------
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -38,14 +36,14 @@ function todayDate() {
 // Referral reward per new friend (once, when they join)
 const REFERRAL_REWARD = 800;
 
-// ----------------- Bot & Express Setup -----------------
+// ------------ Bot & Express Setup ------------
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
-// For verifying mini app auth (Telegram Web App)
+// ------------ Mini-app auth helper ------------
 function parseInitData(initDataRaw) {
   if (!initDataRaw) return {};
   const params = new URLSearchParams(initDataRaw);
@@ -56,12 +54,11 @@ function parseInitData(initDataRaw) {
   return data;
 }
 
-// Get Telegram user ID from initData; for dev fallback, allow query param
+// Get or create a user from Telegram initData / dev fallback
 async function getOrCreateUserFromInitData(req) {
   const initDataRaw = req.body.initData || req.query.initData || "";
   const data = parseInitData(initDataRaw);
 
-  // data.user is JSON string from Telegram, if we're in real mini app
   let telegramUserId = null;
   let username = null;
   let firstName = null;
@@ -94,10 +91,9 @@ async function getOrCreateUserFromInitData(req) {
     throw new Error("Missing Telegram user ID");
   }
 
-  // Upsert user in DB
   const client = await pool.connect();
   try {
-    // Create table if not exists
+    // Create tables if not exist (safe to run many times)
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -127,7 +123,17 @@ async function getOrCreateUserFromInitData(req) {
       );
     `);
 
-    // Find existing user
+    // Basic indexes to make leaderboards faster over time
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_balance
+      ON users (balance DESC);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_today
+      ON users (today_farmed DESC);
+    `);
+
+    // Upsert user
     let res = await client.query(
       `
       SELECT *
@@ -140,7 +146,6 @@ async function getOrCreateUserFromInitData(req) {
 
     let user;
     if (res.rowCount === 0) {
-      // Insert new user
       const insertRes = await client.query(
         `
         INSERT INTO users (
@@ -174,7 +179,7 @@ async function getOrCreateUserFromInitData(req) {
   }
 }
 
-// Daily reset if date changed
+// ------------ Daily reset ------------
 async function ensureDailyReset(user) {
   const today = todayDate();
   if (user.last_reset !== today) {
@@ -195,34 +200,30 @@ async function ensureDailyReset(user) {
   return user;
 }
 
-// Tap logic (server-side)
+// ------------ Tap logic ------------
 async function handleTap(user) {
   const maxEnergy = 50;
   const perTapBase = 1;
 
-  // If out of energy, no earn
   if (user.energy <= 0) {
     return user;
   }
 
-  const now = new Date();
   const nowDay = todayDate();
 
-  // Daily reset if needed
   if (user.last_reset !== nowDay) {
     user = await ensureDailyReset(user);
   }
 
-  // Basic limit: let's say 5000 taps per day as naive anti-bot
   const maxTapsPerDay = 5000;
   if (user.taps_today >= maxTapsPerDay) {
     return user;
   }
 
-  const newBalance = (user.balance || 0) + perTapBase;
-  const newEnergy = (user.energy || 0) - 1;
-  const newToday = (user.today_farmed || 0) + perTapBase;
-  const newTapsToday = (user.taps_today || 0) + 1;
+  const newBalance = Number(user.balance || 0) + perTapBase;
+  const newEnergy = Number(user.energy || 0) - 1;
+  const newToday = Number(user.today_farmed || 0) + perTapBase;
+  const newTapsToday = Number(user.taps_today || 0) + 1;
 
   const upd = await pool.query(
     `
@@ -240,9 +241,38 @@ async function handleTap(user) {
   return upd.rows[0];
 }
 
-// Build state object sent back to frontend
-function buildClientState(user) {
+// ------------ Global rank helper ------------
+async function getGlobalRankForUser(user) {
+  const balance = Number(user.balance || 0);
+
+  const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM users;`);
+  const total = Number(totalRes.rows[0].count || 0);
+
+  if (total === 0) {
+    return { rank: null, total: 0 };
+  }
+
+  const aboveRes = await pool.query(
+    `
+    SELECT COUNT(*) AS count
+    FROM users
+    WHERE balance > $1;
+  `,
+    [balance]
+  );
+
+  const countAbove = Number(aboveRes.rows[0].count || 0);
+  const rank = countAbove + 1;
+
+  return { rank, total };
+}
+
+// ------------ Client state builder ------------
+async function buildClientState(user) {
   const inviteLink = `https://t.me/${BOT_USERNAME}?start=ref_${user.telegram_id}`;
+
+  const { rank, total } = await getGlobalRankForUser(user);
+
   return {
     ok: true,
     balance: Number(user.balance || 0),
@@ -251,22 +281,24 @@ function buildClientState(user) {
     invite_link: inviteLink,
     referrals_count: Number(user.referrals_count || 0),
     referrals_points: Number(user.referrals_points || 0),
+    global_rank: rank,
+    global_total: total,
   };
 }
 
-// ----------------- Express Routes -----------------
+// ------------ Express Routes ------------
 
 // Health check
 app.get("/", (req, res) => {
   res.send("Airdrop Empire backend is running.");
 });
 
-// State route – used by mini app to sync
+// State route – sync for mini app
 app.post("/api/state", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
     user = await ensureDailyReset(user);
-    const state = buildClientState(user);
+    const state = await buildClientState(user);
     res.json(state);
   } catch (err) {
     console.error("Error /api/state:", err);
@@ -279,7 +311,7 @@ app.post("/api/tap", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
     user = await handleTap(user);
-    const state = buildClientState(user);
+    const state = await buildClientState(user);
     res.json(state);
   } catch (err) {
     console.error("Error /api/tap:", err);
@@ -287,7 +319,7 @@ app.post("/api/tap", async (req, res) => {
   }
 });
 
-// Daily task route (simple one-time +1000)
+// Daily task route (simple daily + backend sync)
 app.post("/api/task", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
@@ -299,11 +331,6 @@ app.post("/api/task", async (req, res) => {
 
     const today = todayDate();
 
-    // We'll store daily tasks in a small JSONB column later; for now, one simple daily
-    // For example, if taskName === "instagram_follow", reward once per day.
-    // Here we'll just implement a naive daily reward.
-
-    // Ensure user row has last_daily
     if (user.last_daily !== today) {
       const reward = Number(req.body.reward || 1000);
       const newBalance = Number(user.balance || 0) + reward;
@@ -321,7 +348,7 @@ app.post("/api/task", async (req, res) => {
       user = upd.rows[0];
     }
 
-    const state = buildClientState(user);
+    const state = await buildClientState(user);
     res.json(state);
   } catch (err) {
     console.error("Error /api/task:", err);
@@ -329,11 +356,11 @@ app.post("/api/task", async (req, res) => {
   }
 });
 
-// Friends / referral summary
+// Friends summary (kept for existing front-end)
 app.post("/api/friends", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
-    const state = buildClientState(user);
+    const state = await buildClientState(user);
     res.json(state);
   } catch (err) {
     console.error("Error /api/friends:", err);
@@ -345,7 +372,6 @@ app.post("/api/friends", async (req, res) => {
 app.post("/api/withdraw/info", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
-    // For now, just return balance. Later we add full allocation.
     res.json({
       ok: true,
       balance: Number(user.balance || 0),
@@ -357,7 +383,136 @@ app.post("/api/withdraw/info", async (req, res) => {
   }
 });
 
-// ----------------- Telegram Bot Handlers -----------------
+// ------------ NEW: Global leaderboard ------------
+app.post("/api/leaderboard/global", async (req, res) => {
+  try {
+    let user = await getOrCreateUserFromInitData(req);
+
+    const limit = Math.max(
+      1,
+      Math.min(200, Number(req.body.limit || 100))
+    );
+
+    const lbRes = await pool.query(
+      `
+      SELECT
+        telegram_id,
+        username,
+        first_name,
+        last_name,
+        balance,
+        RANK() OVER (ORDER BY balance DESC, telegram_id ASC) AS global_rank
+      FROM users
+      ORDER BY balance DESC, telegram_id ASC
+      LIMIT $1;
+    `,
+      [limit]
+    );
+
+    const rows = lbRes.rows.map((r) => ({
+      telegram_id: Number(r.telegram_id),
+      username: r.username,
+      first_name: r.first_name,
+      last_name: r.last_name,
+      balance: Number(r.balance || 0),
+      global_rank: Number(r.global_rank),
+    }));
+
+    const { rank, total } = await getGlobalRankForUser(user);
+
+    res.json({
+      ok: true,
+      me: {
+        telegram_id: Number(user.telegram_id),
+        balance: Number(user.balance || 0),
+        global_rank: rank,
+        global_total: total,
+      },
+      global: rows,
+    });
+  } catch (err) {
+    console.error("Error /api/leaderboard/global:", err);
+    res.status(500).json({ ok: false, error: "LEADERBOARD_GLOBAL_ERROR" });
+  }
+});
+
+// ------------ NEW: Friends leaderboard (you + referred friends) ------------
+app.post("/api/leaderboard/friends", async (req, res) => {
+  try {
+    let user = await getOrCreateUserFromInitData(req);
+    const myTid = Number(user.telegram_id);
+
+    const friendsRes = await pool.query(
+      `
+      SELECT DISTINCT
+        CASE
+          WHEN inviter_id = $1 THEN invited_id
+          WHEN invited_id = $1 THEN inviter_id
+        END AS friend_id
+      FROM referrals
+      WHERE inviter_id = $1 OR invited_id = $1;
+    `,
+      [myTid]
+    );
+
+    const friendIds = friendsRes.rows
+      .map((r) => Number(r.friend_id))
+      .filter((v) => !!v && v !== myTid);
+
+    const idsForQuery =
+      friendIds.length > 0 ? [...friendIds, myTid] : [myTid];
+
+    const usersRes = await pool.query(
+      `
+      SELECT telegram_id, username, first_name, last_name, balance
+      FROM users
+      WHERE telegram_id = ANY($1::bigint[]);
+    `,
+      [idsForQuery]
+    );
+
+    const list = usersRes.rows
+      .map((r) => ({
+        telegram_id: Number(r.telegram_id),
+        username: r.username,
+        first_name: r.first_name,
+        last_name: r.last_name,
+        balance: Number(r.balance || 0),
+      }))
+      .sort((a, b) => b.balance - a.balance || a.telegram_id - b.telegram_id)
+      .map((r, idx) => ({
+        ...r,
+        friend_rank: idx + 1,
+      }));
+
+    const meEntry = list.find((x) => x.telegram_id === myTid) || null;
+
+    // Small helper for "overtake next friend" prompt
+    let overtake = null;
+    if (meEntry) {
+      const ahead = list.find((x) => x.friend_rank === meEntry.friend_rank - 1);
+      if (ahead && ahead.balance > meEntry.balance) {
+        overtake = {
+          target_telegram_id: ahead.telegram_id,
+          target_display_name: ahead.username || ahead.first_name || "friend",
+          need_points: ahead.balance - meEntry.balance,
+        };
+      }
+    }
+
+    res.json({
+      ok: true,
+      me: meEntry,
+      friends: list,
+      overtake,
+    });
+  } catch (err) {
+    console.error("Error /api/leaderboard/friends:", err);
+    res.status(500).json({ ok: false, error: "LEADERBOARD_FRIENDS_ERROR" });
+  }
+});
+
+// ------------ Telegram Bot Handlers ------------
 
 // /start – handle possible referral
 bot.start(async (ctx) => {
@@ -372,7 +527,6 @@ bot.start(async (ctx) => {
     try {
       await client.query("BEGIN");
 
-      // Upsert user
       let res = await client.query(
         `
         SELECT *
@@ -404,22 +558,15 @@ bot.start(async (ctx) => {
         user = res.rows[0];
       }
 
-      // Handle referral if start payload like "ref_123"
-      const startPayload = ctx.startPayload; // from Telegraf
+      const startPayload = ctx.startPayload;
       if (startPayload) {
-        // Strip "ref_" prefix if present
-        let inviterId = null;
         let payload = startPayload;
         if (payload.startsWith("ref_")) {
           payload = payload.slice(4);
         }
-        inviterId = Number(payload);
+        const inviterId = Number(payload);
 
-        if (
-          inviterId &&
-          inviterId !== telegramId // avoid self-referral
-        ) {
-          // Record referral if not already existing
+        if (inviterId && inviterId !== telegramId) {
           const refRes = await client.query(
             `
             SELECT *
@@ -430,7 +577,6 @@ bot.start(async (ctx) => {
           );
 
           if (refRes.rowCount === 0) {
-            // Insert referral
             await client.query(
               `
               INSERT INTO referrals (inviter_id, invited_id)
@@ -439,7 +585,6 @@ bot.start(async (ctx) => {
               [inviterId, telegramId]
             );
 
-            // Reward inviter
             await client.query(
               `
               UPDATE users
@@ -462,7 +607,6 @@ bot.start(async (ctx) => {
       client.release();
     }
 
-    // Send welcome message with mini app button
     await ctx.reply(
       "🔥 Welcome to Airdrop Empire!\n\nTap below to open the game 👇",
       {
@@ -471,7 +615,9 @@ bot.start(async (ctx) => {
             [
               {
                 text: "🚀 Open Airdrop Empire",
-                web_app: { url: "https://resilient-kheer-041b8c.netlify.app" },
+                web_app: {
+                  url: "https://resilient-kheer-041b8c.netlify.app",
+                },
               },
             ],
           ],
@@ -500,7 +646,9 @@ bot.command("tap", async (ctx) => {
           [
             {
               text: "🚀 Open Airdrop Empire",
-              web_app: { url: "https://resilient-kheer-041b8c.netlify.app" },
+              web_app: {
+                url: "https://resilient-kheer-041b8c.netlify.app",
+              },
             },
           ],
         ],
@@ -517,7 +665,7 @@ bot.command("referral", async (ctx) => {
   );
 });
 
-// ----------------- Launch -----------------
+// ------------ Launch ------------
 async function start() {
   const PORT = process.env.PORT || 3000;
 
