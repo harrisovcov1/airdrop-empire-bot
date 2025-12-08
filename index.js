@@ -417,7 +417,12 @@ app.post("/api/task", telegramAuthMiddleware, async (req, res) => {
 
     const reward = TASK_REWARDS[code] || 0;
     if (!reward) {
-      console.log("/api/task unknown code", code, "for user", dbUser.telegram_id);
+      console.log(
+        "/api/task unknown or zero reward code",
+        code,
+        "for user",
+        dbUser.telegram_id
+      );
       const clientState = buildClientState(dbUser);
       return res.json(clientState);
     }
@@ -425,7 +430,7 @@ app.post("/api/task", telegramAuthMiddleware, async (req, res) => {
     let updatedUser = dbUser;
 
     if (code === "daily") {
-      // Server-side protection: only once per calendar day
+      // Once per calendar day per user
       const today = todayDate();
       let lastDailyStr = null;
 
@@ -436,7 +441,10 @@ app.post("/api/task", telegramAuthMiddleware, async (req, res) => {
       }
 
       if (lastDailyStr === today) {
-        console.log("/api/task daily already claimed for user", dbUser.telegram_id);
+        console.log(
+          "/api/task daily already claimed for user",
+          dbUser.telegram_id
+        );
       } else {
         const upd = await pool.query(
           `
