@@ -36,6 +36,9 @@ function todayDate() {
 // Referral reward per new friend (once, when they join)
 const REFERRAL_REWARD = 800;
 
+// Cost (in points) for paid energy refill boost
+const ENERGY_REFILL_COST = 500;
+
 // ------------ Bot & Express Setup ------------
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
@@ -513,6 +516,79 @@ app.post("/api/tap", async (req, res) => {
   } catch (err) {
     console.error("Error /api/tap:", err);
     res.status(500).json({ ok: false, error: "TAP_ERROR" });
+  }
+});
+
+// Energy boost – refill energy via action or by spending points (hybrid)
+app.post("/api/boost/energy", async (req, res) => {
+  try {
+    let user = await getOrCreateUserFromInitData(req);
+
+    // Keep energy + daily stats in sync
+    user = await applyEnergyRegen(user);
+    user = await ensureDailyReset(user);
+
+    const method = req.body.method === "points" ? "points" : "action";
+
+    const maxEnergy = Number(user.max_energy || 50);
+    const currentEnergy = Number(user.energy || 0);
+
+    // Already full – nothing to do
+    if (currentEnergy >= maxEnergy) {
+      const state = await buildClientState(user);
+      return res.json({ ...state, ok: false, reason: "ENERGY_FULL" });
+    }
+
+    let updatedUser;
+
+    if (method === "points") {
+      const currentBalance = Number(user.balance || 0);
+
+      if (currentBalance < ENERGY_REFILL_COST) {
+        const state = await buildClientState(user);
+        return res.json({ ...state, ok: false, reason: "NOT_ENOUGH_POINTS" });
+      }
+
+      const upd = await pool.query(
+        `
+        UPDATE users
+        SET balance        = balance - $1,
+            energy         = max_energy,
+            last_energy_ts = NOW()
+        WHERE id = $2
+        RETURNING *;
+        `,
+        [ENERGY_REFILL_COST, user.id]
+      );
+      updatedUser = upd.rows[0];
+    } else {
+      // "action" path – free refill (later we plug real paid offers into this)
+      const upd = await pool.query(
+        `
+        UPDATE users
+        SET energy         = max_energy,
+            last_energy_ts = NOW()
+        WHERE id = $1
+        RETURNING *;
+        `,
+        [user.id]
+      );
+      updatedUser = upd.rows[0];
+    }
+
+    const state = await buildClientState(updatedUser);
+    return res.json({
+      ...state,
+      ok: true,
+message:
+  method === "points"
+    ? `⚡ Energy refilled – ${ENERGY_REFILL_COST.toLocaleString("en-GB")} pts spent.`
+    : "⚡ Free energy boost activated.",
+
+    });
+  } catch (err) {
+    console.error("Error /api/boost/energy:", err);
+    res.status(500).json({ ok: false, error: "BOOST_ENERGY_ERROR" });
   }
 });
 
