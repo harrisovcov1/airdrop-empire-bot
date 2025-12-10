@@ -387,30 +387,43 @@ app.post("/api/state", async (req, res) => {
 // DEBUG: GET state for a given telegram_id (for testing in browser)
 app.get("/api/state-debug", async (req, res) => {
   try {
-    // Use dev fallback: allow telegram_id in query (?telegram_id=123)
+    // Always respond as plain text so it's easy to see in Safari
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+
+    res.write("STATE-DEBUG ROUTE REACHED\n");
+    res.write("query.telegram_id = " + (req.query.telegram_id || "NONE") + "\n\n");
+
     if (!req.query.telegram_id) {
-      return res.status(400).json({ ok: false, error: "MISSING_TELEGRAM_ID" });
+      res.write("ERROR: MISSING_TELEGRAM_ID\n");
+      return res.end();
     }
 
-    // Fake initData user from telegram_id so getOrCreateUserFromInitData works
+    // Use dev fallback: pass telegram_id into our existing helper
     req.body = req.body || {};
     req.body.telegram_id = Number(req.query.telegram_id);
 
+    res.write("Fetching user from DB...\n");
     let user = await getOrCreateUserFromInitData(req);
+    res.write("User row:\n" + JSON.stringify(user, null, 2) + "\n\n");
 
-    // Refill energy based on time passed
+    res.write("Applying energy regeneration...\n");
     user = await applyEnergyRegen(user);
 
-    // Ensure daily counters reset if a new day started
+    res.write("Ensuring daily reset...\n");
     user = await ensureDailyReset(user);
 
     const state = await buildClientState(user);
-    res.json(state);
+    res.write("Final client state:\n" + JSON.stringify(state, null, 2) + "\n");
+
+    return res.end();
   } catch (err) {
     console.error("Error /api/state-debug:", err);
-    res.status(500).json({ ok: false, error: "STATE_DEBUG_ERROR" });
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.write("ERROR IN /api/state-debug:\n" + String(err) + "\n");
+    return res.end();
   }
 });
+
 
 
 
