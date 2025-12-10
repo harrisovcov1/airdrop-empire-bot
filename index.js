@@ -370,7 +370,6 @@ app.post("/api/state", async (req, res) => {
     let user = await getOrCreateUserFromInitData(req);
 
     // Refill energy based on time passed
-    user = await applyEnergyRegen(user);
 
     // Ensure daily counters reset if a new day started
     user = await ensureDailyReset(user);
