@@ -104,14 +104,25 @@ async function getOrCreateUserFromInitData(req) {
         language_code TEXT,
         balance BIGINT DEFAULT 0,
         energy INT DEFAULT 50,
+        max_energy INT DEFAULT 50,
         today_farmed BIGINT DEFAULT 0,
         last_daily DATE,
         last_reset DATE,
+        last_energy_ts TIMESTAMPTZ,
         taps_today INT DEFAULT 0,
         referrals_count INT DEFAULT 0,
         referrals_points BIGINT DEFAULT 0
       );
     `);
+
+
+    await client.query(`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
+      ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ;
+    `);
+
+
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS referrals (
@@ -179,6 +190,67 @@ async function getOrCreateUserFromInitData(req) {
   }
 }
 
+// ------------ Energy Regeneration (Hybrid Model) ------------
+async function applyEnergyRegen(user) {
+  const maxEnergy = user.max_energy || 50;
+  const now = new Date();
+
+  // If never had regen timestamp, set it now
+  if (!user.last_energy_ts) {
+    await pool.query(
+      `UPDATE users SET last_energy_ts = NOW() WHERE id = $1`,
+      [user.id]
+    );
+    user.last_energy_ts = now;
+    return user;
+  }
+
+  const last = new Date(user.last_energy_ts);
+  let diffSeconds = Math.floor((now - last) / 1000);
+  if (diffSeconds <= 0) return user;
+
+  let energy = Number(user.energy || 0);
+
+  while (diffSeconds > 0 && energy < maxEnergy) {
+    let step;
+
+    // Option C Hybrid formula
+    if (energy < 10) {
+      step = 1; // 1 energy per second
+    } else if (energy < 30) {
+      step = 3; // 1 energy per 3 seconds
+    } else {
+      step = 6; // 1 energy per 6 seconds
+    }
+
+    if (diffSeconds >= step) {
+      energy += 1;
+      diffSeconds -= step;
+    } else {
+      break;
+    }
+  }
+
+  if (energy > maxEnergy) energy = maxEnergy;
+
+  // Save updated energy + timestamp
+  await pool.query(
+    `
+    UPDATE users
+    SET energy = $1,
+        last_energy_ts = NOW()
+    WHERE id = $2
+    `,
+    [energy, user.id]
+  );
+
+  user.energy = energy;
+  user.last_energy_ts = now;
+
+  return user;
+}
+
+
 // ------------ Daily reset ------------
 async function ensureDailyReset(user) {
   const today = todayDate();
@@ -188,7 +260,6 @@ async function ensureDailyReset(user) {
       UPDATE users
       SET today_farmed = 0,
           taps_today = 0,
-          energy = 50,
           last_reset = $1
       WHERE id = $2
       RETURNING *;
@@ -199,6 +270,7 @@ async function ensureDailyReset(user) {
   }
   return user;
 }
+
 
 // ------------ Tap logic ------------
 async function handleTap(user) {
@@ -297,7 +369,13 @@ app.get("/", (req, res) => {
 app.post("/api/state", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
+
+    // Refill energy based on time passed
+    user = await applyEnergyRegen(user);
+
+    // Ensure daily counters reset if a new day started
     user = await ensureDailyReset(user);
+
     const state = await buildClientState(user);
     res.json(state);
   } catch (err) {
@@ -310,7 +388,16 @@ app.post("/api/state", async (req, res) => {
 app.post("/api/tap", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
+
+    // First refill based on time
+    user = await applyEnergyRegen(user);
+
+    // Make sure daily limits / counters reset
+    user = await ensureDailyReset(user);
+
+    // Spend 1 energy + add balance
     user = await handleTap(user);
+
     const state = await buildClientState(user);
     res.json(state);
   } catch (err) {
@@ -318,6 +405,7 @@ app.post("/api/tap", async (req, res) => {
     res.status(500).json({ ok: false, error: "TAP_ERROR" });
   }
 });
+
 
 // Daily task route (simple daily + backend sync)
 app.post("/api/task", async (req, res) => {
