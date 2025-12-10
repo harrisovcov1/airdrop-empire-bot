@@ -195,14 +195,11 @@ async function applyEnergyRegen(user) {
   const maxEnergy = user.max_energy || 50;
   const now = new Date();
 
-  // If never had regen timestamp, set it now
+  // If never had regen timestamp, pretend they've been away for a while
+  // so we can safely top them up.
   if (!user.last_energy_ts) {
-    await pool.query(
-      `UPDATE users SET last_energy_ts = NOW() WHERE id = $1`,
-      [user.id]
-    );
-    user.last_energy_ts = now;
-    return user;
+    // Treat as if last update was 1 hour ago
+    user.last_energy_ts = new Date(now.getTime() - 60 * 60 * 1000);
   }
 
   const last = new Date(user.last_energy_ts);
@@ -216,11 +213,11 @@ async function applyEnergyRegen(user) {
 
     // Option C Hybrid formula
     if (energy < 10) {
-      step = 1; // 1 energy per second
+      step = 1;   // 1 energy per second
     } else if (energy < 30) {
-      step = 3; // 1 energy per 3 seconds
+      step = 3;   // 1 energy per 3 seconds
     } else {
-      step = 6; // 1 energy per 6 seconds
+      step = 6;   // 1 energy per 6 seconds
     }
 
     if (diffSeconds >= step) {
@@ -233,7 +230,6 @@ async function applyEnergyRegen(user) {
 
   if (energy > maxEnergy) energy = maxEnergy;
 
-  // Save updated energy + timestamp
   await pool.query(
     `
     UPDATE users
@@ -249,6 +245,7 @@ async function applyEnergyRegen(user) {
 
   return user;
 }
+
 
 
 // ------------ Daily reset ------------
