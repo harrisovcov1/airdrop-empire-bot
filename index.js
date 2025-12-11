@@ -130,6 +130,7 @@ async function getOrCreateUserFromInitData(req) {
       );
     `);
 
+    // Safety alter (idempotent)
     await client.query(`
       ALTER TABLE users
       ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
@@ -191,6 +192,18 @@ async function getOrCreateUserFromInitData(req) {
       );
     `);
 
+    // ---------- One-time backend tasks (e.g. Instagram follow) ----------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS user_tasks (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        task_name TEXT NOT NULL,
+        reward BIGINT DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (user_id, task_name)
+      );
+    `);
+
     // Indexes
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_users_balance
@@ -207,6 +220,10 @@ async function getOrCreateUserFromInitData(req) {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_ad_sessions_user
       ON ad_sessions (user_id);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_user_tasks_user
+      ON user_tasks (user_id);
     `);
 
     // Upsert user
@@ -494,7 +511,6 @@ async function applyGenericReward(user, rewardType, rewardAmount) {
 async function applyMissionReward(user, mission) {
   return applyGenericReward(user, mission.payout_type, mission.payout_amount);
 }
-
 // ------------ Express Routes ------------
 
 // Health check
@@ -1057,37 +1073,46 @@ app.post("/api/boost/completeAd", async (req, res) => {
   }
 });
 
-// ------------ Daily task route (simple daily + backend sync) ------------
+// ------------ Tasks route (daily + one-time tasks like Instagram) ------------
 app.post("/api/task", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
-    const taskName = req.body.taskName;
+    const taskName = (req.body.taskName || "").trim();
 
     if (!taskName) {
       return res.status(400).json({ ok: false, error: "MISSING_TASK_NAME" });
     }
 
+    const reward = Number(req.body.reward || 1000);
     const today = todayDate();
 
-    // Normalise last_daily into YYYY-MM-DD string
-    let lastDailyStr = null;
-    try {
-      if (user.last_daily) {
-        if (typeof user.last_daily === "string") {
-          lastDailyStr = user.last_daily.slice(0, 10);
-        } else {
-          const tmp = new Date(user.last_daily);
-          if (!isNaN(tmp)) lastDailyStr = tmp.toISOString().slice(0, 10);
+    if (taskName === "daily") {
+      // Normalise last_daily into YYYY-MM-DD string
+      let lastDailyStr = null;
+      try {
+        if (user.last_daily) {
+          if (typeof user.last_daily === "string") {
+            lastDailyStr = user.last_daily.slice(0, 10);
+          } else {
+            const tmp = new Date(user.last_daily);
+            if (!isNaN(tmp)) lastDailyStr = tmp.toISOString().slice(0, 10);
+          }
         }
+      } catch (e) {
+        console.error("Bad last_daily:", user.last_daily, e);
+        lastDailyStr = null;
       }
-    } catch (e) {
-      console.error("Bad last_daily:", user.last_daily, e);
-      lastDailyStr = null;
-    }
 
-    // Only pay once per calendar day, no more infinite spam
-    if (lastDailyStr !== today) {
-      const reward = Number(req.body.reward || 1000);
+      // Only pay once per calendar day
+      if (lastDailyStr === today) {
+        const state = await buildClientState(user);
+        return res.json({
+          ...state,
+          ok: false,
+          reason: "DAILY_ALREADY_CLAIMED",
+        });
+      }
+
       const newBalance = Number(user.balance || 0) + reward;
 
       // Streak logic
@@ -1106,14 +1131,72 @@ app.post("/api/task", async (req, res) => {
             streak_days = $3
         WHERE id = $4
         RETURNING *;
-      `,
+        `,
         [newBalance, today, newStreak, user.id]
       );
       user = upd.rows[0];
-    }
 
-    const state = await buildClientState(user);
-    res.json(state);
+      const state = await buildClientState(user);
+      return res.json({
+        ...state,
+        ok: true,
+        reason: "DAILY_OK",
+      });
+    } else {
+      // One-time named tasks (e.g. instagram_follow, future socials, etc.)
+      // Prevent infinite spam via user_tasks unique constraint
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        const ins = await client.query(
+          `
+          INSERT INTO user_tasks (user_id, task_name, reward)
+          VALUES ($1, $2, $3)
+          ON CONFLICT (user_id, task_name)
+          DO NOTHING
+          RETURNING id;
+          `,
+          [user.id, taskName, reward]
+        );
+
+        if (ins.rowCount === 0) {
+          // Already completed before
+          await client.query("COMMIT");
+          const state = await buildClientState(user);
+          return res.json({
+            ...state,
+            ok: false,
+            reason: "TASK_ALREADY_COMPLETED",
+          });
+        }
+
+        const upd = await client.query(
+          `
+          UPDATE users
+          SET balance = balance + $1
+          WHERE id = $2
+          RETURNING *;
+          `,
+          [reward, user.id]
+        );
+        user = upd.rows[0];
+
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
+      }
+
+      const state = await buildClientState(user);
+      return res.json({
+        ...state,
+        ok: true,
+        reason: "TASK_COMPLETED_ONCE",
+      });
+    }
   } catch (err) {
     console.error("Error /api/task:", err);
     res.status(500).json({ ok: false, error: "TASK_ERROR" });
@@ -1379,7 +1462,6 @@ app.post("/api/leaderboard/friends", async (req, res) => {
     res.status(500).json({ ok: false, error: "LEADERBOARD_FRIENDS_ERROR" });
   }
 });
-
 // ------------ Telegram Bot Handlers ------------
 
 // /start – handle possible referral
