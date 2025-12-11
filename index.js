@@ -1,5 +1,5 @@
 // index.js
-// Airdrop Empire – Backend Engine (leaderboards + referrals + tasks)
+// Airdrop Empire – Backend Engine (leaderboards + referrals + tasks + missions)
 //
 // Stack: Express API + Telegraf bot + Postgres (Supabase-style via pg.Pool)
 
@@ -28,9 +28,16 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Small helper
+// Small helpers
 function todayDate() {
-  return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+  // UTC YYYY-MM-DD
+  return new Date().toISOString().slice(0, 10);
+}
+
+function yesterdayDate() {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
 }
 
 // Referral reward per new friend (once, when they join)
@@ -118,7 +125,8 @@ async function getOrCreateUserFromInitData(req) {
         taps_today INT DEFAULT 0,
         referrals_count BIGINT DEFAULT 0,
         referrals_points BIGINT DEFAULT 0,
-        double_boost_until TIMESTAMPTZ
+        double_boost_until TIMESTAMPTZ,
+        streak_days INT DEFAULT 0
       );
     `);
 
@@ -126,7 +134,8 @@ async function getOrCreateUserFromInitData(req) {
       ALTER TABLE users
       ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
       ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS double_boost_until TIMESTAMPTZ;
+      ADD COLUMN IF NOT EXISTS double_boost_until TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS streak_days INT DEFAULT 0;
     `);
 
     await client.query(`
@@ -139,7 +148,7 @@ async function getOrCreateUserFromInitData(req) {
       );
     `);
 
-    // ---------- NEW: Missions + Ad sessions ----------
+    // ---------- Missions + Ad sessions ----------
     await client.query(`
       CREATE TABLE IF NOT EXISTS missions (
         id SERIAL PRIMARY KEY,
@@ -147,7 +156,7 @@ async function getOrCreateUserFromInitData(req) {
         title TEXT NOT NULL,
         description TEXT,
         payout_type TEXT NOT NULL,       -- 'points', 'energy_refill', 'double_10m'
-        payout_amount BIGINT DEFAULT 0,  -- used for 'points' (and for future flexible rewards)
+        payout_amount BIGINT DEFAULT 0,  -- used for 'points' (and flexible rewards)
         url TEXT,
         kind TEXT,                       -- 'ad', 'social', 'offerwall', 'pro'
         is_active BOOLEAN DEFAULT TRUE,
@@ -182,7 +191,7 @@ async function getOrCreateUserFromInitData(req) {
       );
     `);
 
-    // Basic indexes to make leaderboards & lookups faster
+    // Indexes
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_users_balance
       ON users (balance DESC);
@@ -224,9 +233,10 @@ async function getOrCreateUserFromInitData(req) {
           taps_today,
           referrals_count,
           referrals_points,
-          double_boost_until
+          double_boost_until,
+          streak_days
         )
-        VALUES ($1, $2, $3, $4, $5, 0, 50, 0, NULL, NULL, 0, 0, 0, NULL)
+        VALUES ($1, $2, $3, $4, $5, 0, 50, 0, NULL, NULL, 0, 0, 0, NULL, 0)
         RETURNING *;
       `,
         [telegramUserId, username, firstName, lastName, languageCode]
@@ -391,7 +401,7 @@ async function getGlobalRankForUser(user) {
 }
 
 // ------------ Build state for frontend ------------
-  async function buildClientState(user) {
+async function buildClientState(user) {
   const inviteLink = `https://t.me/${BOT_USERNAME}?start=ref_${user.telegram_id}`;
 
   const { rank, total } = await getGlobalRankForUser(user);
@@ -411,6 +421,7 @@ async function getGlobalRankForUser(user) {
     ok: true,
     balance: Number(user.balance || 0),
     energy: Number(user.energy || 0),
+    max_energy: Number(user.max_energy || 50),
     today: Number(user.today_farmed || 0),
     invite_link: inviteLink,
     referrals_count: Number(user.referrals_count || 0),
@@ -419,9 +430,9 @@ async function getGlobalRankForUser(user) {
     global_total: total,
     double_boost_active: doubleBoostActive,
     double_boost_until: doubleBoostUntil,
+    streak_days: Number(user.streak_days || 0),
   };
 }
-
 
 // ------------ NEW: generic reward helpers ------------
 async function applyGenericReward(user, rewardType, rewardAmount) {
@@ -483,6 +494,7 @@ async function applyGenericReward(user, rewardType, rewardAmount) {
 async function applyMissionReward(user, mission) {
   return applyGenericReward(user, mission.payout_type, mission.payout_amount);
 }
+
 // ------------ Express Routes ------------
 
 // Health check
@@ -756,7 +768,7 @@ app.post("/api/boost/double", async (req, res) => {
   }
 });
 
-// ------------ NEW: Missions API ------------
+// ------------ Missions API ------------
 
 // List active missions + user status
 app.post("/api/mission/list", async (req, res) => {
@@ -952,7 +964,7 @@ app.post("/api/mission/complete", async (req, res) => {
   }
 });
 
-// ------------ NEW: Rewarded Ad helper endpoints ------------
+// ------------ Rewarded Ad helper endpoints ------------
 
 // Create an ad session (front-end calls before showing video/ad)
 app.post("/api/boost/requestAd", async (req, res) => {
@@ -1045,7 +1057,7 @@ app.post("/api/boost/completeAd", async (req, res) => {
   }
 });
 
-// Daily task route (simple daily + backend sync, FIXED one-claim-per-day)
+// ------------ Daily task route (simple daily + backend sync) ------------
 app.post("/api/task", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
@@ -1055,17 +1067,17 @@ app.post("/api/task", async (req, res) => {
       return res.status(400).json({ ok: false, error: "MISSING_TASK_NAME" });
     }
 
-    const today = todayDate(); // "YYYY-MM-DD"
+    const today = todayDate();
 
-    // Normalise last_daily (can be Date or null)
+    // Normalise last_daily into YYYY-MM-DD string
     let lastDailyStr = null;
     try {
       if (user.last_daily) {
         if (typeof user.last_daily === "string") {
           lastDailyStr = user.last_daily.slice(0, 10);
         } else {
-          const d = new Date(user.last_daily);
-          if (!isNaN(d)) lastDailyStr = d.toISOString().slice(0, 10);
+          const tmp = new Date(user.last_daily);
+          if (!isNaN(tmp)) lastDailyStr = tmp.toISOString().slice(0, 10);
         }
       }
     } catch (e) {
@@ -1073,20 +1085,29 @@ app.post("/api/task", async (req, res) => {
       lastDailyStr = null;
     }
 
-    // Only reward if today is different from last_daily
+    // Only pay once per calendar day, no more infinite spam
     if (lastDailyStr !== today) {
       const reward = Number(req.body.reward || 1000);
       const newBalance = Number(user.balance || 0) + reward;
+
+      // Streak logic
+      let newStreak = Number(user.streak_days || 0) || 0;
+      if (lastDailyStr === yesterdayDate()) {
+        newStreak += 1;
+      } else {
+        newStreak = 1; // reset / start new streak
+      }
 
       const upd = await pool.query(
         `
         UPDATE users
         SET balance = $1,
-            last_daily = $2
-        WHERE id = $3
+            last_daily = $2,
+            streak_days = $3
+        WHERE id = $4
         RETURNING *;
-        `,
-        [newBalance, today, user.id]
+      `,
+        [newBalance, today, newStreak, user.id]
       );
       user = upd.rows[0];
     }
@@ -1098,7 +1119,6 @@ app.post("/api/task", async (req, res) => {
     res.status(500).json({ ok: false, error: "TASK_ERROR" });
   }
 });
-
 
 // Friends summary (kept for existing front-end)
 app.post("/api/friends", async (req, res) => {
@@ -1359,6 +1379,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
     res.status(500).json({ ok: false, error: "LEADERBOARD_FRIENDS_ERROR" });
   }
 });
+
 // ------------ Telegram Bot Handlers ------------
 
 // /start – handle possible referral
