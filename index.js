@@ -99,7 +99,7 @@ async function getOrCreateUserFromInitData(req) {
 
   const client = await pool.connect();
   try {
-    // Create tables if not exist (safe to run many times)
+    // Create tables if not exist
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -122,6 +122,7 @@ async function getOrCreateUserFromInitData(req) {
       );
     `);
 
+    // Ensure new columns exist
     await client.query(`
       ALTER TABLE users
       ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
@@ -139,7 +140,6 @@ async function getOrCreateUserFromInitData(req) {
       );
     `);
 
-    // Basic indexes to make leaderboards faster over time
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_users_balance
       ON users (balance DESC);
@@ -150,18 +150,13 @@ async function getOrCreateUserFromInitData(req) {
     `);
 
     // Upsert user
-    let res = await client.query(
-      `
-      SELECT *
-      FROM users
-      WHERE telegram_id = $1
-      LIMIT 1;
-    `,
+    const existing = await client.query(
+      `SELECT * FROM users WHERE telegram_id = $1 LIMIT 1;`,
       [telegramUserId]
     );
 
     let user;
-    if (res.rowCount === 0) {
+    if (existing.rowCount === 0) {
       const insertRes = await client.query(
         `
         INSERT INTO users (
@@ -187,7 +182,7 @@ async function getOrCreateUserFromInitData(req) {
       );
       user = insertRes.rows[0];
     } else {
-      user = res.rows[0];
+      user = existing.rows[0];
     }
 
     return user;
@@ -201,7 +196,7 @@ async function applyEnergyRegen(user) {
   const maxEnergy = user.max_energy || 50;
   const now = new Date();
 
-  // If never had regen timestamp, pretend they've been away for a while
+  // If never had regen timestamp → assume long offline
   if (!user.last_energy_ts) {
     user.last_energy_ts = new Date(now.getTime() - 60 * 60 * 1000);
   }
@@ -215,21 +210,14 @@ async function applyEnergyRegen(user) {
   while (diffSeconds > 0 && energy < maxEnergy) {
     let step;
 
-    // Hybrid formula
-    if (energy < 10) {
-      step = 1;   // 1 energy per second
-    } else if (energy < 30) {
-      step = 3;   // 1 energy per 3 seconds
-    } else {
-      step = 6;   // 1 energy per 6 seconds
-    }
+    if (energy < 10) step = 1;      // fast regen
+    else if (energy < 30) step = 3; // medium regen
+    else step = 6;                  // slow regen
 
     if (diffSeconds >= step) {
       energy += 1;
       diffSeconds -= step;
-    } else {
-      break;
-    }
+    } else break;
   }
 
   if (energy > maxEnergy) energy = maxEnergy;
@@ -250,137 +238,122 @@ async function applyEnergyRegen(user) {
   return user;
 }
 
-// ------------ Daily reset ------------
+// ------------ Daily reset logic ------------
 async function ensureDailyReset(user) {
   const today = todayDate();
-
   let lastResetStr = null;
 
   try {
     if (user.last_reset) {
       if (typeof user.last_reset === "string") {
         lastResetStr = user.last_reset.slice(0, 10);
-      } else if (user.last_reset instanceof Date && !isNaN(user.last_reset)) {
-        lastResetStr = user.last_reset.toISOString().slice(0, 10);
       } else {
         const tmp = new Date(user.last_reset);
-        if (!isNaN(tmp)) {
-          lastResetStr = tmp.toISOString().slice(0, 10);
-        }
+        if (!isNaN(tmp)) lastResetStr = tmp.toISOString().slice(0, 10);
       }
     }
   } catch (e) {
-    console.error("ensureDailyReset: bad last_reset value:", user.last_reset, e);
+    console.error("Bad last_reset:", user.last_reset, e);
     lastResetStr = null;
   }
 
-  if (lastResetStr === today) {
-    return user;
-  }
+  if (lastResetStr === today) return user;
 
-  const res = await pool.query(
+  const updated = await pool.query(
     `
       UPDATE users
       SET today_farmed = 0,
-          taps_today   = 0,
-          energy       = max_energy,
-          last_reset   = $1
+          taps_today = 0,
+          energy = max_energy,
+          last_reset = $1
       WHERE id = $2
       RETURNING *;
     `,
     [today, user.id]
   );
 
-  return res.rows[0];
+  return updated.rows[0];
 }
 
-// (legacy helper – not used by routes but kept updated)
+// ------------ Legacy tap helper (kept for compatibility) ------------
 async function handleTap(user) {
   const maxEnergy = 50;
-  const perTapBase = 1;
+  if (user.energy <= 0) return user;
 
-  if (user.energy <= 0) {
-    return user;
-  }
-
-  const nowDay = todayDate();
-
-  if (user.last_reset !== nowDay) {
+  if (todayDate() !== user.last_reset) {
     user = await ensureDailyReset(user);
   }
 
-  const maxTapsPerDay = 5000;
-  if (user.taps_today >= maxTapsPerDay) {
-    return user;
+  if (user.taps_today >= 5000) return user;
+
+  let perTap = 1;
+
+  if (
+    user.double_boost_until &&
+    new Date(user.double_boost_until) > new Date()
+  ) {
+    perTap = 2;
   }
 
-  // Double-boost awareness
-  const now = new Date();
-  let perTap = perTapBase;
-  if (user.double_boost_until && new Date(user.double_boost_until) > now) {
-    perTap = perTapBase * 2;
-  }
+  const newBalance = Number(user.balance) + perTap;
+  const newEnergy = Number(user.energy) - 1;
+  const newToday = Number(user.today_farmed) + perTap;
 
-  const newBalance = Number(user.balance || 0) + perTap;
-  const newEnergy = Number(user.energy || 0) - 1;
-  const newToday = Number(user.today_farmed || 0) + perTap;
-  const newTapsToday = Number(user.taps_today || 0) + 1;
-
-  const upd = await pool.query(
+  const updated = await pool.query(
     `
     UPDATE users
     SET balance = $1,
         energy = $2,
         today_farmed = $3,
-        taps_today = $4
-    WHERE id = $5
+        taps_today = taps_today + 1
+    WHERE id = $4
     RETURNING *;
   `,
-    [newBalance, newEnergy, newToday, newTapsToday, user.id]
+    [newBalance, newEnergy, newToday, user.id]
   );
 
-  return upd.rows[0];
+  return updated.rows[0];
 }
+
 // ------------ Global rank helper ------------
 async function getGlobalRankForUser(user) {
   const balance = Number(user.balance || 0);
 
   const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM users;`);
-  const total = Number(totalRes.rows[0].count || 0);
+  const total = Number(totalRes.rows[0].count);
 
-  if (total === 0) {
-    return { rank: null, total: 0 };
-  }
+  if (total === 0) return { rank: null, total: 0 };
 
   const aboveRes = await pool.query(
     `
     SELECT COUNT(*) AS count
     FROM users
     WHERE balance > $1;
-  `,
+    `,
     [balance]
   );
 
-  const countAbove = Number(aboveRes.rows[0].count || 0);
-  const rank = countAbove + 1;
-
-  return { rank, total };
+  const countAbove = Number(aboveRes.rows[0].count);
+  return {
+    rank: countAbove + 1,
+    total,
+  };
 }
 
-// ------------ Client state builder ------------
+// ------------ Build state for frontend ------------
 async function buildClientState(user) {
   const inviteLink = `https://t.me/${BOT_USERNAME}?start=ref_${user.telegram_id}`;
 
   const { rank, total } = await getGlobalRankForUser(user);
 
-  // Double boost status
   let doubleBoostActive = false;
   let doubleBoostUntil = null;
+
   if (user.double_boost_until) {
-    const untilDate = new Date(user.double_boost_until);
-    if (!isNaN(untilDate)) {
-      doubleBoostUntil = untilDate.toISOString();
-      doubleBoostActive = untilDate > new Date();
+    const until = new Date(user.double_boost_until);
+    if (!isNaN(until)) {
+      doubleBoostUntil = until.toISOString();
+      doubleBoostActive = until > new Date();
     }
   }
 
@@ -398,7 +371,6 @@ async function buildClientState(user) {
     double_boost_until: doubleBoostUntil,
   };
 }
-
 // ------------ Express Routes ------------
 
 // Health check
@@ -521,7 +493,6 @@ app.post("/api/tap", async (req, res) => {
     );
 
     const updatedUser = upd.rows[0];
-
     const state = await buildClientState(updatedUser);
     return res.json({ ...state, ok: true });
   } catch (err) {
@@ -738,7 +709,10 @@ app.post("/api/leaderboard/global", async (req, res) => {
     try {
       user = await getOrCreateUserFromInitData(req);
     } catch (e) {
-      console.error("getOrCreateUserFromInitData failed in GLOBAL leaderboard:", e.message || e);
+      console.error(
+        "getOrCreateUserFromInitData failed in GLOBAL leaderboard:",
+        e.message || e
+      );
     }
 
     const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
@@ -796,7 +770,10 @@ app.post("/api/leaderboard/daily", async (req, res) => {
     try {
       user = await getOrCreateUserFromInitData(req);
     } catch (e) {
-      console.error("getOrCreateUserFromInitData failed in DAILY leaderboard:", e.message || e);
+      console.error(
+        "getOrCreateUserFromInitData failed in DAILY leaderboard:",
+        e.message || e
+      );
     }
 
     const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
@@ -865,7 +842,6 @@ app.post("/api/leaderboard/daily", async (req, res) => {
     res.status(500).json({ ok: false, error: "LEADERBOARD_DAILY_ERROR" });
   }
 });
-
 // ------------ NEW: Friends leaderboard ------------
 app.post("/api/leaderboard/friends", async (req, res) => {
   try {
@@ -873,7 +849,10 @@ app.post("/api/leaderboard/friends", async (req, res) => {
     try {
       user = await getOrCreateUserFromInitData(req);
     } catch (e) {
-      console.error("getOrCreateUserFromInitData failed in FRIENDS leaderboard:", e.message || e);
+      console.error(
+        "getOrCreateUserFromInitData failed in FRIENDS leaderboard:",
+        e.message || e
+      );
     }
 
     if (!user || !user.telegram_id) {
@@ -954,6 +933,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
     res.status(500).json({ ok: false, error: "LEADERBOARD_FRIENDS_ERROR" });
   }
 });
+
 // ------------ Telegram Bot Handlers ------------
 
 // /start – handle possible referral
@@ -1107,7 +1087,7 @@ bot.command("referral", async (ctx) => {
   );
 });
 
-// ------------ Launch ------------
+// ------------ Launch (with 409-safe bot startup) ------------
 async function start() {
   const PORT = process.env.PORT || 3000;
 
@@ -1115,8 +1095,26 @@ async function start() {
     console.log(`🌐 Express API running on port ${PORT}`);
   });
 
-  await bot.launch();
-  console.log("🤖 Telegram bot launched as @%s", BOT_USERNAME);
+  // In Render you can get 409 if another instance or a local dev bot is polling.
+  // We catch that so Express keeps running.
+  try {
+    await bot.launch();
+    console.log("🤖 Telegram bot launched as @%s", BOT_USERNAME);
+  } catch (err) {
+    if (
+      (err && err.code === 409) ||
+      (err && err.response && err.response.error_code === 409) ||
+      String(err).includes("409")
+    ) {
+      console.error(
+        "⚠️ TelegramError 409: another getUpdates is already running. " +
+          "Bot polling disabled for this instance, API will still work."
+      );
+    } else {
+      console.error("Fatal bot launch error:", err);
+      process.exit(1);
+    }
+  }
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
