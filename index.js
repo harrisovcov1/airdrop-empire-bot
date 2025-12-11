@@ -99,7 +99,7 @@ async function getOrCreateUserFromInitData(req) {
 
   const client = await pool.connect();
   try {
-    // Create tables if not exist
+    // ---------- Core tables ----------
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -122,7 +122,6 @@ async function getOrCreateUserFromInitData(req) {
       );
     `);
 
-    // Ensure new columns exist
     await client.query(`
       ALTER TABLE users
       ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
@@ -140,6 +139,50 @@ async function getOrCreateUserFromInitData(req) {
       );
     `);
 
+    // ---------- NEW: Missions + Ad sessions ----------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS missions (
+        id SERIAL PRIMARY KEY,
+        code TEXT UNIQUE NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        payout_type TEXT NOT NULL,       -- 'points', 'energy_refill', 'double_10m'
+        payout_amount BIGINT DEFAULT 0,  -- used for 'points' (and for future flexible rewards)
+        url TEXT,
+        kind TEXT,                       -- 'ad', 'social', 'offerwall', 'pro'
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS user_missions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        mission_id INTEGER NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'started',  -- 'started', 'completed', 'verified'
+        started_at TIMESTAMPTZ DEFAULT NOW(),
+        completed_at TIMESTAMPTZ,
+        verified_at TIMESTAMPTZ,
+        reward_applied BOOLEAN DEFAULT FALSE,
+        UNIQUE (user_id, mission_id)
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ad_sessions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        network TEXT,
+        reward_type TEXT NOT NULL,       -- 'points', 'energy_refill', 'double_10m'
+        reward_amount BIGINT DEFAULT 0,  -- for 'points'; optional for others
+        status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'completed'
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        completed_at TIMESTAMPTZ
+      );
+    `);
+
+    // Basic indexes to make leaderboards & lookups faster
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_users_balance
       ON users (balance DESC);
@@ -147,6 +190,14 @@ async function getOrCreateUserFromInitData(req) {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_users_today
       ON users (today_farmed DESC);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_user_missions_user
+      ON user_missions (user_id);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_ad_sessions_user
+      ON ad_sessions (user_id);
     `);
 
     // Upsert user
@@ -277,7 +328,6 @@ async function ensureDailyReset(user) {
 
 // ------------ Legacy tap helper (kept for compatibility) ------------
 async function handleTap(user) {
-  const maxEnergy = 50;
   if (user.energy <= 0) return user;
 
   if (todayDate() !== user.last_reset) {
@@ -371,6 +421,67 @@ async function buildClientState(user) {
     double_boost_until: doubleBoostUntil,
   };
 }
+
+// ------------ NEW: generic reward helpers ------------
+async function applyGenericReward(user, rewardType, rewardAmount) {
+  const type = rewardType || "points";
+  const amount = Number(rewardAmount || 0);
+  let updatedUser = user;
+
+  if (type === "points" && amount > 0) {
+    const res = await pool.query(
+      `
+      UPDATE users
+      SET balance = balance + $1
+      WHERE id = $2
+      RETURNING *;
+      `,
+      [amount, user.id]
+    );
+    updatedUser = res.rows[0];
+  } else if (type === "energy_refill") {
+    const res = await pool.query(
+      `
+      UPDATE users
+      SET energy = max_energy,
+          last_energy_ts = NOW()
+      WHERE id = $1
+      RETURNING *;
+      `,
+      [user.id]
+    );
+    updatedUser = res.rows[0];
+  } else if (type === "double_10m") {
+    const now = new Date();
+    const current =
+      user.double_boost_until && !isNaN(new Date(user.double_boost_until))
+        ? new Date(user.double_boost_until)
+        : now;
+    const base = current > now ? current : now;
+    const minutes = amount > 0 ? amount : 10;
+    const newUntil = new Date(base.getTime() + minutes * 60 * 1000);
+
+    const res = await pool.query(
+      `
+      UPDATE users
+      SET double_boost_until = $1
+      WHERE id = $2
+      RETURNING *;
+      `,
+      [newUntil.toISOString(), user.id]
+    );
+    updatedUser = res.rows[0];
+  } else {
+    // Unknown reward type – no-op for safety
+    console.warn("Unknown reward type:", type);
+  }
+
+  return updatedUser;
+}
+
+async function applyMissionReward(user, mission) {
+  return applyGenericReward(user, mission.payout_type, mission.payout_amount);
+}
 // ------------ Express Routes ------------
 
 // Health check
@@ -403,7 +514,9 @@ app.get("/api/state-debug", async (req, res) => {
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
 
     res.write("STATE-DEBUG ROUTE REACHED\n");
-    res.write("query.telegram_id = " + (req.query.telegram_id || "NONE") + "\n\n");
+    res.write(
+      "query.telegram_id = " + (req.query.telegram_id || "NONE") + "\n\n"
+    );
 
     if (!req.query.telegram_id) {
       res.write("ERROR: MISSING_TELEGRAM_ID\n");
@@ -527,7 +640,11 @@ app.post("/api/boost/energy", async (req, res) => {
 
       if (currentBalance < ENERGY_REFILL_COST) {
         const state = await buildClientState(user);
-        return res.json({ ...state, ok: false, reason: "NOT_ENOUGH_POINTS" });
+        return res.json({
+          ...state,
+          ok: false,
+          reason: "NOT_ENOUGH_POINTS",
+        });
       }
 
       const upd = await pool.query(
@@ -638,6 +755,295 @@ app.post("/api/boost/double", async (req, res) => {
   }
 });
 
+// ------------ NEW: Missions API ------------
+
+// List active missions + user status
+app.post("/api/mission/list", async (req, res) => {
+  try {
+    const user = await getOrCreateUserFromInitData(req);
+    const kind = req.body.kind || null;
+
+    const params = [];
+    let where = "WHERE is_active = TRUE";
+    if (kind) {
+      params.push(kind);
+      where += ` AND kind = $${params.length}`;
+    }
+
+    const missionsRes = await pool.query(
+      `
+      SELECT id, code, title, description, payout_type, payout_amount, url, kind
+      FROM missions
+      ${where}
+      ORDER BY id ASC;
+      `,
+      params
+    );
+
+    const missionIds = missionsRes.rows.map((m) => m.id);
+    let userMissionMap = {};
+    if (missionIds.length > 0) {
+      const umRes = await pool.query(
+        `
+        SELECT mission_id, status, reward_applied
+        FROM user_missions
+        WHERE user_id = $1 AND mission_id = ANY($2::int[]);
+        `,
+        [user.id, missionIds]
+      );
+      userMissionMap = umRes.rows.reduce((acc, r) => {
+        acc[r.mission_id] = {
+          status: r.status,
+          reward_applied: r.reward_applied,
+        };
+        return acc;
+      }, {});
+    }
+
+    const missions = missionsRes.rows.map((m) => {
+      const um = userMissionMap[m.id];
+      return {
+        code: m.code,
+        title: m.title,
+        description: m.description,
+        payout_type: m.payout_type,
+        payout_amount: Number(m.payout_amount || 0),
+        url: m.url,
+        kind: m.kind,
+        status: um ? um.status : "not_started",
+        reward_applied: um ? um.reward_applied : false,
+      };
+    });
+
+    res.json({
+      ok: true,
+      missions,
+    });
+  } catch (err) {
+    console.error("Error /api/mission/list:", err);
+    res.status(500).json({ ok: false, error: "MISSION_LIST_ERROR" });
+  }
+});
+
+// Start a mission (returns redirect URL)
+app.post("/api/mission/start", async (req, res) => {
+  try {
+    const user = await getOrCreateUserFromInitData(req);
+    const code = (req.body.code || "").trim();
+
+    if (!code) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "MISSING_MISSION_CODE" });
+    }
+
+    const missionRes = await pool.query(
+      `
+      SELECT *
+      FROM missions
+      WHERE code = $1 AND is_active = TRUE
+      LIMIT 1;
+      `,
+      [code]
+    );
+
+    if (missionRes.rowCount === 0) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "MISSION_NOT_FOUND_OR_INACTIVE" });
+    }
+
+    const mission = missionRes.rows[0];
+
+    await pool.query(
+      `
+      INSERT INTO user_missions (user_id, mission_id, status, started_at)
+      VALUES ($1, $2, 'started', NOW())
+      ON CONFLICT (user_id, mission_id)
+      DO UPDATE SET
+        status = 'started',
+        started_at = COALESCE(user_missions.started_at, NOW());
+      `,
+      [user.id, mission.id]
+    );
+
+    res.json({
+      ok: true,
+      code: mission.code,
+      redirect_url: mission.url,
+    });
+  } catch (err) {
+    console.error("Error /api/mission/start:", err);
+    res.status(500).json({ ok: false, error: "MISSION_START_ERROR" });
+  }
+});
+
+// Complete a mission (MVP: trust client)
+app.post("/api/mission/complete", async (req, res) => {
+  try {
+    let user = await getOrCreateUserFromInitData(req);
+    const code = (req.body.code || "").trim();
+
+    if (!code) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "MISSING_MISSION_CODE" });
+    }
+
+    const missionRes = await pool.query(
+      `
+      SELECT *
+      FROM missions
+      WHERE code = $1
+      LIMIT 1;
+      `,
+      [code]
+    );
+
+    if (missionRes.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "MISSION_NOT_FOUND" });
+    }
+
+    const mission = missionRes.rows[0];
+
+    const umRes = await pool.query(
+      `
+      INSERT INTO user_missions (user_id, mission_id, status, started_at, completed_at)
+      VALUES ($1, $2, 'completed', NOW(), NOW())
+      ON CONFLICT (user_id, mission_id)
+      DO UPDATE SET
+        status = 'completed',
+        completed_at = COALESCE(user_missions.completed_at, NOW())
+      RETURNING *;
+      `,
+      [user.id, mission.id]
+    );
+
+    const userMission = umRes.rows[0];
+
+    if (!userMission.reward_applied) {
+      user = await applyMissionReward(user, mission);
+
+      await pool.query(
+        `
+        UPDATE user_missions
+        SET reward_applied = TRUE,
+            verified_at = NOW()
+        WHERE id = $1;
+        `,
+        [userMission.id]
+      );
+    }
+
+    const state = await buildClientState(user);
+    res.json({
+      ...state,
+      ok: true,
+      mission: {
+        code: mission.code,
+        status: "completed",
+        reward_applied: true,
+      },
+    });
+  } catch (err) {
+    console.error("Error /api/mission/complete:", err);
+    res.status(500).json({ ok: false, error: "MISSION_COMPLETE_ERROR" });
+  }
+});
+
+// ------------ NEW: Rewarded Ad helper endpoints ------------
+
+// Create an ad session (front-end calls before showing video/ad)
+app.post("/api/boost/requestAd", async (req, res) => {
+  try {
+    const user = await getOrCreateUserFromInitData(req);
+
+    const rewardType = req.body.reward_type || "energy_refill"; // 'points', 'energy_refill', 'double_10m'
+    const rewardAmount = Number(req.body.reward_amount || 0);
+    const network = req.body.network || null;
+
+    const validTypes = ["points", "energy_refill", "double_10m"];
+    if (!validTypes.includes(rewardType)) {
+      return res.status(400).json({ ok: false, error: "BAD_REWARD_TYPE" });
+    }
+
+    const adRes = await pool.query(
+      `
+      INSERT INTO ad_sessions (user_id, network, reward_type, reward_amount, status)
+      VALUES ($1, $2, $3, $4, 'pending')
+      RETURNING id, reward_type, reward_amount;
+      `,
+      [user.id, network, rewardType, rewardAmount]
+    );
+
+    const session = adRes.rows[0];
+
+    res.json({
+      ok: true,
+      ad_session_id: session.id,
+      reward_type: session.reward_type,
+      reward_amount: Number(session.reward_amount || 0),
+    });
+  } catch (err) {
+    console.error("Error /api/boost/requestAd:", err);
+    res.status(500).json({ ok: false, error: "REQUEST_AD_ERROR" });
+  }
+});
+
+// Mark ad session as completed & apply reward
+app.post("/api/boost/completeAd", async (req, res) => {
+  try {
+    let user = await getOrCreateUserFromInitData(req);
+    const sessionId = Number(req.body.ad_session_id || 0);
+
+    if (!sessionId) {
+      return res.status(400).json({ ok: false, error: "MISSING_SESSION_ID" });
+    }
+
+    const adRes = await pool.query(
+      `
+      SELECT *
+      FROM ad_sessions
+      WHERE id = $1 AND user_id = $2 AND status = 'pending'
+      LIMIT 1;
+      `,
+      [sessionId, user.id]
+    );
+
+    if (adRes.rowCount === 0) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "AD_SESSION_NOT_FOUND_OR_USED" });
+    }
+
+    const ad = adRes.rows[0];
+
+    // Apply reward via same generic engine as missions
+    user = await applyGenericReward(user, ad.reward_type, ad.reward_amount);
+
+    await pool.query(
+      `
+      UPDATE ad_sessions
+      SET status = 'completed',
+          completed_at = NOW()
+      WHERE id = $1;
+      `,
+      [ad.id]
+    );
+
+    const state = await buildClientState(user);
+
+    res.json({
+      ...state,
+      ok: true,
+      message: "🎁 Ad reward applied.",
+    });
+  } catch (err) {
+    console.error("Error /api/boost/completeAd:", err);
+    res.status(500).json({ ok: false, error: "COMPLETE_AD_ERROR" });
+  }
+});
+
 // Daily task route (simple daily + backend sync)
 app.post("/api/task", async (req, res) => {
   try {
@@ -702,7 +1108,7 @@ app.post("/api/withdraw/info", async (req, res) => {
   }
 });
 
-// ------------ NEW: Global leaderboard ------------
+// ------------ Global leaderboard ------------
 app.post("/api/leaderboard/global", async (req, res) => {
   try {
     let user = null;
@@ -763,7 +1169,7 @@ app.post("/api/leaderboard/global", async (req, res) => {
   }
 });
 
-// ------------ NEW: Daily leaderboard (today_farmed) ------------
+// ------------ Daily leaderboard (today_farmed) ------------
 app.post("/api/leaderboard/daily", async (req, res) => {
   try {
     let user = null;
@@ -842,7 +1248,8 @@ app.post("/api/leaderboard/daily", async (req, res) => {
     res.status(500).json({ ok: false, error: "LEADERBOARD_DAILY_ERROR" });
   }
 });
-// ------------ NEW: Friends leaderboard ------------
+
+// ------------ Friends leaderboard ------------
 app.post("/api/leaderboard/friends", async (req, res) => {
   try {
     let user = null;
@@ -933,7 +1340,6 @@ app.post("/api/leaderboard/friends", async (req, res) => {
     res.status(500).json({ ok: false, error: "LEADERBOARD_FRIENDS_ERROR" });
   }
 });
-
 // ------------ Telegram Bot Handlers ------------
 
 // /start – handle possible referral
@@ -1095,8 +1501,6 @@ async function start() {
     console.log(`🌐 Express API running on port ${PORT}`);
   });
 
-  // In Render you can get 409 if another instance or a local dev bot is polling.
-  // We catch that so Express keeps running.
   try {
     await bot.launch();
     console.log("🤖 Telegram bot launched as @%s", BOT_USERNAME);
