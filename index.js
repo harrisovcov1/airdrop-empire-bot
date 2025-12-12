@@ -7,20 +7,11 @@ const express = require("express");
 const cors = require("cors");
 const { Telegraf } = require("telegraf");
 const { Pool } = require("pg");
-const crypto = require("crypto");
 
 // ------------ Environment ------------
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const BOT_USERNAME = process.env.BOT_USERNAME || "AirdropEmpireAppBot";
-
-// WebApp URL is used by the Telegram bot buttons.
-// Set WEB_APP_URL in Render env vars to avoid hardcoded Netlify links.
-const WEB_APP_URL = (process.env.WEB_APP_URL || "https://resilient-kheer-041b8c.netlify.app").trim();
-
-// Dev-only fallback for testing without Telegram initData.
-// In production, keep this OFF.
-const ALLOW_DEV_FALLBACK = String(process.env.ALLOW_DEV_FALLBACK || "").trim() === "1";
 
 // Render / scaling safe: set DISABLE_BOT_POLLING=1 to stop 409 conflicts
 const DISABLE_BOT_POLLING = String(process.env.DISABLE_BOT_POLLING || "").trim() === "1";
@@ -54,9 +45,6 @@ const ENERGY_REFILL_COST = 500;
 // Cost (in points) for paid double-points boost (10 mins)
 const DOUBLE_BOOST_COST = 1000;
 
-// Anti-cheat: minimum time between taps (server-side). Keep modest to avoid false positives.
-const MIN_TAP_INTERVAL_MS = Number(process.env.MIN_TAP_INTERVAL_MS || 200);
-
 // ------------ Bot & Express Setup ------------
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
@@ -75,65 +63,8 @@ function parseInitData(initDataRaw) {
   return data;
 }
 
-// Telegram WebApp initData validation (prevents fake telegram_id / balance minting)
-// Docs: https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
-function validateInitData(initDataRaw) {
-  if (!initDataRaw) return false;
-  const params = new URLSearchParams(initDataRaw);
-  const hash = params.get("hash");
-  if (!hash) return false;
-
-  // Build data_check_string
-  const pairs = [];
-  for (const [key, value] of params.entries()) {
-    if (key === "hash") continue;
-    pairs.push(`${key}=${value}`);
-  }
-  pairs.sort();
-  const dataCheckString = pairs.join("\n");
-
-  // secret_key = HMAC_SHA256("WebAppData", bot_token)
-  const secretKey = crypto
-    .createHmac("sha256", "WebAppData")
-    .update(BOT_TOKEN)
-    .digest();
-
-  const computedHash = crypto
-    .createHmac("sha256", secretKey)
-    .update(dataCheckString)
-    .digest("hex");
-
-  return computedHash === hash;
-}
-
 // ------------ Ensure Supabase schema exists (SAFE) ------------
 async function ensureSchema(client) {
-  // Create users table if missing (keeps existing table if already present).
-  // NOTE: If you are using a custom public.users schema already, this is a no-op.
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS public.users (
-      id SERIAL PRIMARY KEY,
-      telegram_id BIGINT,
-      username TEXT,
-      first_name TEXT,
-      last_name TEXT,
-      language_code TEXT,
-      balance BIGINT DEFAULT 0,
-      energy INT DEFAULT 50,
-      max_energy INT DEFAULT 50,
-      today_farmed BIGINT DEFAULT 0,
-      last_daily DATE,
-      last_daily_ts TIMESTAMPTZ,
-      last_reset DATE,
-      last_energy_ts TIMESTAMPTZ,
-      last_tap_ts TIMESTAMPTZ,
-      taps_today INT DEFAULT 0,
-      referrals_count BIGINT DEFAULT 0,
-      referrals_points BIGINT DEFAULT 0,
-      double_boost_until TIMESTAMPTZ
-    );
-  `);
-
   // Ensure users has the columns our backend needs (keeps your existing Supabase columns too)
   await client.query(`
     ALTER TABLE public.users
@@ -152,10 +83,8 @@ async function ensureSchema(client) {
     ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
     ADD COLUMN IF NOT EXISTS today_farmed BIGINT DEFAULT 0,
     ADD COLUMN IF NOT EXISTS last_daily DATE,
-    ADD COLUMN IF NOT EXISTS last_daily_ts TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS last_reset DATE,
     ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS last_tap_ts TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS taps_today INT DEFAULT 0,
     ADD COLUMN IF NOT EXISTS referrals_count BIGINT DEFAULT 0,
     ADD COLUMN IF NOT EXISTS referrals_points BIGINT DEFAULT 0,
@@ -230,14 +159,6 @@ async function ensureSchema(client) {
 // Get or create a user from Telegram initData / dev fallback
 async function getOrCreateUserFromInitData(req) {
   const initDataRaw = req.body.initData || req.query.initData || "";
-  // If initData is provided, validate it. This blocks spoofed telegram_id.
-  if (initDataRaw) {
-    const valid = validateInitData(initDataRaw);
-    if (!valid) {
-      throw new Error("INVALID_INIT_DATA");
-    }
-  }
-
   const data = parseInitData(initDataRaw);
 
   let telegramUserId = null;
@@ -261,9 +182,6 @@ async function getOrCreateUserFromInitData(req) {
 
   // DEV fallback: allow telegram_id in body or query
   if (!telegramUserId) {
-    if (!ALLOW_DEV_FALLBACK) {
-      throw new Error("MISSING_TELEGRAM_USER");
-    }
     if (req.body.telegram_id) {
       telegramUserId = Number(req.body.telegram_id);
     } else if (req.query.telegram_id) {
@@ -293,15 +211,13 @@ async function getOrCreateUserFromInitData(req) {
         max_energy,
         today_farmed,
         last_daily,
-        last_daily_ts,
         last_reset,
         taps_today,
         referrals_count,
         referrals_points,
-        double_boost_until,
-        last_tap_ts
+        double_boost_until
       )
-      VALUES ($1, $2, $3, $4, $5, 0, 50, 50, 0, NULL, NULL, NULL, 0, 0, 0, NULL, NULL)
+      VALUES ($1, $2, $3, $4, $5, 0, 50, 50, 0, NULL, NULL, 0, 0, 0, NULL)
       ON CONFLICT (telegram_id)
       DO UPDATE SET
         username = COALESCE(EXCLUDED.username, public.users.username),
@@ -566,10 +482,6 @@ app.get("/", (req, res) => {
   res.send("Airdrop Empire backend is running.");
 });
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "airdrop-empire-backend" });
-});
-
 // State route – sync for mini app
 app.post("/api/state", async (req, res) => {
   try {
@@ -640,19 +552,6 @@ app.post("/api/tap", async (req, res) => {
     // 2) New day? reset today_farmed, taps_today, and refill to max
     user = await ensureDailyReset(user);
 
-    // 2.5) Anti-cheat: throttle extremely fast tapping
-    const nowTs = new Date();
-    if (user.last_tap_ts) {
-      const lastTap = new Date(user.last_tap_ts);
-      if (!isNaN(lastTap)) {
-        const diffMs = nowTs - lastTap;
-        if (diffMs >= 0 && diffMs < MIN_TAP_INTERVAL_MS) {
-          const state = await buildClientState(user);
-          return res.json({ ...state, ok: false, reason: "TAP_TOO_FAST" });
-        }
-      }
-    }
-
     // 3) If no energy, don't allow tap
     const currentEnergy = Number(user.energy || 0);
     if (currentEnergy <= 0) {
@@ -670,7 +569,7 @@ app.post("/api/tap", async (req, res) => {
 
     // 5) Spend 1 energy + add points (double if boost still active)
     const basePerTap = 1;
-    const now = nowTs;
+    const now = new Date();
     let perTap = basePerTap;
 
     if (user.double_boost_until) {
@@ -692,8 +591,7 @@ app.post("/api/tap", async (req, res) => {
           energy         = $2,
           today_farmed   = $3,
           taps_today     = $4,
-          last_energy_ts = NOW(),
-          last_tap_ts    = NOW()
+          last_energy_ts = NOW()
       WHERE id = $5
       RETURNING *;
       `,
@@ -727,13 +625,6 @@ app.post("/api/boost/energy", async (req, res) => {
       return res.json({ ...state, ok: false, reason: "ENERGY_FULL" });
     }
 
-    // IMPORTANT: Do not allow free "action" refills directly. Use the rewarded-ad flow:
-    // /api/boost/requestAd -> show sponsor -> /api/boost/completeAd
-    if (method !== "points") {
-      const state = await buildClientState(user);
-      return res.json({ ...state, ok: false, reason: "USE_REWARDED_AD" });
-    }
-
     let updatedUser;
 
     if (method === "points") {
@@ -760,13 +651,30 @@ app.post("/api/boost/energy", async (req, res) => {
         [ENERGY_REFILL_COST, user.id]
       );
       updatedUser = upd.rows[0];
+    } else {
+      const upd = await pool.query(
+        `
+        UPDATE public.users
+        SET energy         = max_energy,
+            last_energy_ts = NOW()
+        WHERE id = $1
+        RETURNING *;
+        `,
+        [user.id]
+      );
+      updatedUser = upd.rows[0];
     }
 
     const state = await buildClientState(updatedUser);
     return res.json({
       ...state,
       ok: true,
-      message: `⚡ Energy refilled – ${ENERGY_REFILL_COST.toLocaleString("en-GB")} pts spent.`,
+      message:
+        method === "points"
+          ? `⚡ Energy refilled – ${ENERGY_REFILL_COST.toLocaleString(
+              "en-GB"
+            )} pts spent.`
+          : "⚡ Free energy boost activated.",
     });
   } catch (err) {
     console.error("Error /api/boost/energy:", err);
@@ -784,13 +692,6 @@ app.post("/api/boost/double", async (req, res) => {
     user = await ensureDailyReset(user);
 
     const method = req.body.method === "points" ? "points" : "action";
-
-    // IMPORTANT: Do not allow free "action" double boosts directly. Use the rewarded-ad flow:
-    // /api/boost/requestAd -> show sponsor -> /api/boost/completeAd (with reward_type=double_10m)
-    if (method !== "points") {
-      const state = await buildClientState(user);
-      return res.json({ ...state, ok: false, reason: "USE_REWARDED_AD" });
-    }
 
     let updatedUser;
 
@@ -813,6 +714,19 @@ app.post("/api/boost/double", async (req, res) => {
         [DOUBLE_BOOST_COST, user.id]
       );
       updatedUser = upd.rows[0];
+    } else {
+      // "action" path – free sponsor-based boost
+      const upd = await pool.query(
+        `
+        UPDATE public.users
+        SET double_boost_until =
+              GREATEST(COALESCE(double_boost_until, NOW()), NOW()) + INTERVAL '10 minutes'
+        WHERE id = $1
+        RETURNING *;
+        `,
+        [user.id]
+      );
+      updatedUser = upd.rows[0];
     }
 
     const state = await buildClientState(updatedUser);
@@ -820,7 +734,12 @@ app.post("/api/boost/double", async (req, res) => {
     return res.json({
       ...state,
       ok: true,
-      message: `✨ Double points active – ${DOUBLE_BOOST_COST.toLocaleString("en-GB")} pts spent.`,
+      message:
+        method === "points"
+          ? `✨ Double points active – ${DOUBLE_BOOST_COST.toLocaleString(
+              "en-GB"
+            )} pts spent.`
+          : "✨ Free double points boost activated!",
     });
   } catch (err) {
     console.error("Error /api/boost/double:", err);
@@ -1127,52 +1046,41 @@ app.post("/api/task", async (req, res) => {
       return res.status(400).json({ ok: false, error: "MISSING_TASK_NAME" });
     }
 
-    // Lock down allowed tasks so the client cannot mint arbitrary rewards.
-    if (taskName !== "daily") {
-      const state = await buildClientState(user);
-      return res.json({ ...state, ok: false, reason: "UNKNOWN_TASK" });
-    }
+    const today = todayDate(); // "YYYY-MM-DD"
 
-    const reward = 500; // fixed server-side (do not trust client)
-
-    // Enforce true 24h cooldown using last_daily_ts (not just calendar date).
-    const now = new Date();
-    let lastTs = null;
-
-    if (user.last_daily_ts) {
-      const d = new Date(user.last_daily_ts);
-      if (!isNaN(d)) lastTs = d;
-    } else if (user.last_daily) {
-      // Backwards compatibility: if old DATE exists, treat it as midnight UTC.
-      try {
-        const d = new Date(String(user.last_daily).slice(0, 10) + "T00:00:00.000Z");
-        if (!isNaN(d)) lastTs = d;
-      } catch (_) {
-        lastTs = null;
+    // Normalise last_daily (can be Date or null)
+    let lastDailyStr = null;
+    try {
+      if (user.last_daily) {
+        if (typeof user.last_daily === "string") {
+          lastDailyStr = user.last_daily.slice(0, 10);
+        } else {
+          const d = new Date(user.last_daily);
+          if (!isNaN(d)) lastDailyStr = d.toISOString().slice(0, 10);
+        }
       }
+    } catch (e) {
+      console.error("Bad last_daily:", user.last_daily, e);
+      lastDailyStr = null;
     }
 
-    if (lastTs) {
-      const diffMs = now - lastTs;
-      if (diffMs >= 0 && diffMs < 24 * 60 * 60 * 1000) {
-        const nextAt = new Date(lastTs.getTime() + 24 * 60 * 60 * 1000);
-        const state = await buildClientState(user);
-        return res.json({ ...state, ok: false, reason: "COOLDOWN", next_at: nextAt.toISOString() });
-      }
-    }
+    // Only reward if today is different from last_daily
+    if (lastDailyStr !== today) {
+      const reward = Number(req.body.reward || 1000);
+      const newBalance = Number(user.balance || 0) + reward;
 
-    const upd = await pool.query(
-      `
-      UPDATE public.users
-      SET balance = balance + $1,
-          last_daily_ts = NOW(),
-          last_daily = $2
-      WHERE id = $3
-      RETURNING *;
-      `,
-      [reward, todayDate(), user.id]
-    );
-    user = upd.rows[0];
+      const upd = await pool.query(
+        `
+        UPDATE public.users
+        SET balance = $1,
+            last_daily = $2
+        WHERE id = $3
+        RETURNING *;
+        `,
+        [newBalance, today, user.id]
+      );
+      user = upd.rows[0];
+    }
 
     const state = await buildClientState(user);
     res.json(state);
@@ -1534,7 +1442,7 @@ bot.start(async (ctx) => {
               {
                 text: "🚀 Open Airdrop Empire",
                 web_app: {
-                  url: WEB_APP_URL,
+                  url: "https://resilient-kheer-041b8c.netlify.app",
                 },
               },
             ],
@@ -1565,7 +1473,7 @@ bot.command("tap", async (ctx) => {
             {
               text: "🚀 Open Airdrop Empire",
               web_app: {
-                url: WEB_APP_URL,
+                url: "https://resilient-kheer-041b8c.netlify.app",
               },
             },
           ],
