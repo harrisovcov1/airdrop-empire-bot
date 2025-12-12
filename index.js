@@ -13,12 +13,6 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const BOT_USERNAME = process.env.BOT_USERNAME || "AirdropEmpireAppBot";
 
-// ✅ LOCKED to resilient-kheer (your chosen live frontend)
-const WEB_APP_URL =
-  process.env.WEB_APP_URL || "https://resilient-kheer-041b8c.netlify.app";
-const FRONTEND_ORIGIN =
-  process.env.FRONTEND_ORIGIN || "https://resilient-kheer-041b8c.netlify.app";
-
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN is missing");
   process.exit(1);
@@ -42,38 +36,11 @@ function todayDate() {
 // Referral reward per new friend (once, when they join)
 const REFERRAL_REWARD = 800;
 
-// Cost (in points) for paid energy refill boost
-const ENERGY_REFILL_COST = 500;
-
 // ------------ Bot & Express Setup ------------
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
 
-// ✅ CORS FIX (preflight + allow only your chosen Netlify origin)
-// This fixes the browser error: "No 'Access-Control-Allow-Origin' header..."
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      // Allow server-to-server calls (no Origin) + Telegram internal webviews
-      if (!origin) return cb(null, true);
-
-      // Allow your locked frontend origin
-      if (origin === FRONTEND_ORIGIN) return cb(null, true);
-
-      // Optional: allow the other Netlify site if you ever need it for dev
-      // if (origin === "https://airdrop-empire-frontend.netlify.app") return cb(null, true);
-
-      return cb(new Error("Not allowed by CORS: " + origin));
-    },
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "X-Telegram-Init-Data"],
-    credentials: true,
-  })
-);
-
-// ✅ Preflight handler (critical for POST from browsers)
-app.options("*", cors());
-
+app.use(cors());
 app.use(express.json());
 
 // ------------ Mini-app auth helper ------------
@@ -87,22 +54,9 @@ function parseInitData(initDataRaw) {
   return data;
 }
 
-// ✅ Pull initData from body/query/header (more reliable)
-function getInitDataFromReq(req) {
-  return (
-    req.body?.initData ||
-    req.query?.initData ||
-    req.get("x-telegram-init-data") ||
-    req.get("X-Telegram-Init-Data") ||
-    req.body?.tgWebAppData ||
-    req.query?.tgWebAppData ||
-    ""
-  );
-}
-
 // Get or create a user from Telegram initData / dev fallback
 async function getOrCreateUserFromInitData(req) {
-  const initDataRaw = getInitDataFromReq(req);
+  const initDataRaw = req.body.initData || req.query.initData || "";
   const data = parseInitData(initDataRaw);
 
   let telegramUserId = null;
@@ -124,7 +78,7 @@ async function getOrCreateUserFromInitData(req) {
     }
   }
 
-  // DEV fallback: allow telegram_id in body or query (state-debug etc.)
+  // DEV fallback: allow telegram_id in body or query
   if (!telegramUserId) {
     if (req.body.telegram_id) {
       telegramUserId = Number(req.body.telegram_id);
@@ -134,10 +88,7 @@ async function getOrCreateUserFromInitData(req) {
   }
 
   if (!telegramUserId) {
-    // ✅ Make this a controlled error we can handle in routes
-    const err = new Error("Missing Telegram user ID");
-    err.code = "NEED_TELEGRAM";
-    throw err;
+    throw new Error("Missing Telegram user ID");
   }
 
   const client = await pool.connect();
@@ -164,11 +115,14 @@ async function getOrCreateUserFromInitData(req) {
       );
     `);
 
+
     await client.query(`
       ALTER TABLE users
       ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
       ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ;
     `);
+
+
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS referrals (
@@ -235,14 +189,17 @@ async function getOrCreateUserFromInitData(req) {
     client.release();
   }
 }
+
 // ------------ Energy Regeneration (Hybrid Model) ------------
 async function applyEnergyRegen(user) {
   const maxEnergy = user.max_energy || 50;
   const now = new Date();
 
   // If never had regen timestamp, pretend they've been away for a while
+  // so we can safely top them up.
   if (!user.last_energy_ts) {
-    user.last_energy_ts = new Date(now.getTime() - 60 * 60 * 1000); // 1 hour ago
+    // Treat as if last update was 1 hour ago
+    user.last_energy_ts = new Date(now.getTime() - 60 * 60 * 1000);
   }
 
   const last = new Date(user.last_energy_ts);
@@ -255,9 +212,13 @@ async function applyEnergyRegen(user) {
     let step;
 
     // Option C Hybrid formula
-    if (energy < 10) step = 1; // 1 energy per second
-    else if (energy < 30) step = 3; // 1 energy per 3 seconds
-    else step = 6; // 1 energy per 6 seconds
+    if (energy < 10) {
+      step = 1;   // 1 energy per second
+    } else if (energy < 30) {
+      step = 3;   // 1 energy per 3 seconds
+    } else {
+      step = 6;   // 1 energy per 6 seconds
+    }
 
     if (diffSeconds >= step) {
       energy += 1;
@@ -285,6 +246,8 @@ async function applyEnergyRegen(user) {
   return user;
 }
 
+
+
 // ------------ Daily reset ------------
 async function ensureDailyReset(user) {
   const today = todayDate();
@@ -294,21 +257,27 @@ async function ensureDailyReset(user) {
   try {
     if (user.last_reset) {
       if (typeof user.last_reset === "string") {
+        // e.g. '2025-12-10' or '2025-12-10T00:00:00.000Z'
         lastResetStr = user.last_reset.slice(0, 10);
       } else if (user.last_reset instanceof Date && !isNaN(user.last_reset)) {
         lastResetStr = user.last_reset.toISOString().slice(0, 10);
       } else {
         const tmp = new Date(user.last_reset);
-        if (!isNaN(tmp)) lastResetStr = tmp.toISOString().slice(0, 10);
+        if (!isNaN(tmp)) {
+          lastResetStr = tmp.toISOString().slice(0, 10);
+        }
       }
     }
   } catch (e) {
     console.error("ensureDailyReset: bad last_reset value:", user.last_reset, e);
+    // Force a safe reset below
     lastResetStr = null;
   }
 
   // If same calendar day, nothing to do
-  if (lastResetStr === today) return user;
+  if (lastResetStr === today) {
+    return user;
+  }
 
   // Different (or unknown) day → reset daily counters + refill energy
   const res = await pool.query(
@@ -327,19 +296,29 @@ async function ensureDailyReset(user) {
   return res.rows[0];
 }
 
-// ------------ Tap logic (kept for compatibility) ------------
+
+
+
+
+// ------------ Tap logic ------------
 async function handleTap(user) {
+  const maxEnergy = 50;
   const perTapBase = 1;
 
-  if (user.energy <= 0) return user;
+  if (user.energy <= 0) {
+    return user;
+  }
 
   const nowDay = todayDate();
+
   if (user.last_reset !== nowDay) {
     user = await ensureDailyReset(user);
   }
 
   const maxTapsPerDay = 5000;
-  if (user.taps_today >= maxTapsPerDay) return user;
+  if (user.taps_today >= maxTapsPerDay) {
+    return user;
+  }
 
   const newBalance = Number(user.balance || 0) + perTapBase;
   const newEnergy = Number(user.energy || 0) - 1;
@@ -352,8 +331,7 @@ async function handleTap(user) {
     SET balance = $1,
         energy = $2,
         today_farmed = $3,
-        taps_today = $4,
-        last_energy_ts = NOW()
+        taps_today = $4
     WHERE id = $5
     RETURNING *;
   `,
@@ -370,7 +348,9 @@ async function getGlobalRankForUser(user) {
   const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM users;`);
   const total = Number(totalRes.rows[0].count || 0);
 
-  if (total === 0) return { rank: null, total: 0 };
+  if (total === 0) {
+    return { rank: null, total: 0 };
+  }
 
   const aboveRes = await pool.query(
     `
@@ -390,6 +370,7 @@ async function getGlobalRankForUser(user) {
 // ------------ Client state builder ------------
 async function buildClientState(user) {
   const inviteLink = `https://t.me/${BOT_USERNAME}?start=ref_${user.telegram_id}`;
+
   const { rank, total } = await getGlobalRankForUser(user);
 
   return {
@@ -405,17 +386,6 @@ async function buildClientState(user) {
   };
 }
 
-// ------------ Error helper (avoid 500 for "open outside telegram") ------------
-function handleNeedTelegram(res) {
-  return res.status(401).json({
-    ok: false,
-    error: "NEED_TELEGRAM",
-    message: "Open this inside Telegram to play.",
-    open_in_telegram: `https://t.me/${BOT_USERNAME}`,
-    web_app_url: WEB_APP_URL,
-  });
-}
-
 // ------------ Express Routes ------------
 
 // Health check
@@ -428,8 +398,8 @@ app.post("/api/state", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
 
-    // Refill energy based on time passed
-    user = await applyEnergyRegen(user);
+    // ✅ Refill energy based on time passed
+    user = await applyEnergyRegen(user);   // ← ADD THIS LINE
 
     // Ensure daily counters reset if a new day started
     user = await ensureDailyReset(user);
@@ -437,17 +407,18 @@ app.post("/api/state", async (req, res) => {
     const state = await buildClientState(user);
     res.json(state);
   } catch (err) {
-    if (err && (err.code === "NEED_TELEGRAM" || String(err.message).includes("Missing Telegram user ID"))) {
-      return handleNeedTelegram(res);
-    }
     console.error("Error /api/state:", err);
     res.status(500).json({ ok: false, error: "STATE_ERROR" });
   }
 });
 
+
+
+
 // DEBUG: GET state for a given telegram_id (for testing in browser)
 app.get("/api/state-debug", async (req, res) => {
   try {
+    // Always respond as plain text so it's easy to see in Safari
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
 
     res.write("STATE-DEBUG ROUTE REACHED\n");
@@ -458,6 +429,7 @@ app.get("/api/state-debug", async (req, res) => {
       return res.end();
     }
 
+    // Use dev fallback: pass telegram_id into our existing helper
     req.body = req.body || {};
     req.body.telegram_id = Number(req.query.telegram_id);
 
@@ -483,20 +455,27 @@ app.get("/api/state-debug", async (req, res) => {
   }
 });
 
+
+
 // Tap route – regen + spend 1 energy + add 1 point
 app.post("/api/tap", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
 
+    // ✅ 1) Refill energy first, based on last_energy_ts
     user = await applyEnergyRegen(user);
+
+    // ✅ 2) New day? reset today_farmed, taps_today, and refill to max
     user = await ensureDailyReset(user);
 
+    // ✅ 3) If no energy, don't allow tap
     const currentEnergy = Number(user.energy || 0);
     if (currentEnergy <= 0) {
       const state = await buildClientState(user);
       return res.json({ ...state, ok: false, reason: "NO_ENERGY" });
     }
 
+    // ✅ 4) Daily tap cap
     const maxTapsPerDay = 5000;
     const currentTaps = Number(user.taps_today || 0);
     if (currentTaps >= maxTapsPerDay) {
@@ -504,91 +483,40 @@ app.post("/api/tap", async (req, res) => {
       return res.json({ ...state, ok: false, reason: "MAX_TAPS_REACHED" });
     }
 
-    // Use shared tap helper (updates last_energy_ts too)
-    const updatedUser = await handleTap(user);
+    // ✅ 5) Spend 1 energy + add 1 point
+    const perTapBase = 1;
 
+    const newBalance = Number(user.balance || 0) + perTapBase;
+    const newEnergy  = currentEnergy - 1;
+    const newToday   = Number(user.today_farmed || 0) + perTapBase;
+    const newTaps    = currentTaps + 1;
+
+    const upd = await pool.query(
+      `
+      UPDATE users
+      SET balance       = $1,
+          energy        = $2,
+          today_farmed  = $3,
+          taps_today    = $4,
+          last_energy_ts = NOW()
+      WHERE id = $5
+      RETURNING *;
+      `,
+      [newBalance, newEnergy, newToday, newTaps, user.id]
+    );
+
+    const updatedUser = upd.rows[0];
+
+    // ✅ 6) Build client state from the *updated* row
     const state = await buildClientState(updatedUser);
     return res.json({ ...state, ok: true });
   } catch (err) {
-    if (err && (err.code === "NEED_TELEGRAM" || String(err.message).includes("Missing Telegram user ID"))) {
-      return handleNeedTelegram(res);
-    }
     console.error("Error /api/tap:", err);
     res.status(500).json({ ok: false, error: "TAP_ERROR" });
   }
 });
 
-// Energy boost – refill energy via action or by spending points (hybrid)
-app.post("/api/boost/energy", async (req, res) => {
-  try {
-    let user = await getOrCreateUserFromInitData(req);
 
-    user = await applyEnergyRegen(user);
-    user = await ensureDailyReset(user);
-
-    const method = req.body.method === "points" ? "points" : "action";
-
-    const maxEnergy = Number(user.max_energy || 50);
-    const currentEnergy = Number(user.energy || 0);
-
-    if (currentEnergy >= maxEnergy) {
-      const state = await buildClientState(user);
-      return res.json({ ...state, ok: false, reason: "ENERGY_FULL" });
-    }
-
-    let updatedUser;
-
-    if (method === "points") {
-      const currentBalance = Number(user.balance || 0);
-
-      if (currentBalance < ENERGY_REFILL_COST) {
-        const state = await buildClientState(user);
-        return res.json({ ...state, ok: false, reason: "NOT_ENOUGH_POINTS" });
-      }
-
-      const upd = await pool.query(
-        `
-        UPDATE users
-        SET balance        = balance - $1,
-            energy         = max_energy,
-            last_energy_ts = NOW()
-        WHERE id = $2
-        RETURNING *;
-        `,
-        [ENERGY_REFILL_COST, user.id]
-      );
-      updatedUser = upd.rows[0];
-    } else {
-      const upd = await pool.query(
-        `
-        UPDATE users
-        SET energy         = max_energy,
-            last_energy_ts = NOW()
-        WHERE id = $1
-        RETURNING *;
-        `,
-        [user.id]
-      );
-      updatedUser = upd.rows[0];
-    }
-
-    const state = await buildClientState(updatedUser);
-    return res.json({
-      ...state,
-      ok: true,
-      message:
-        method === "points"
-          ? `⚡ Energy refilled – ${ENERGY_REFILL_COST.toLocaleString("en-GB")} pts spent.`
-          : "⚡ Free energy boost activated.",
-    });
-  } catch (err) {
-    if (err && (err.code === "NEED_TELEGRAM" || String(err.message).includes("Missing Telegram user ID"))) {
-      return handleNeedTelegram(res);
-    }
-    console.error("Error /api/boost/energy:", err);
-    res.status(500).json({ ok: false, error: "BOOST_ENERGY_ERROR" });
-  }
-});
 
 // Daily task route (simple daily + backend sync)
 app.post("/api/task", async (req, res) => {
@@ -602,21 +530,7 @@ app.post("/api/task", async (req, res) => {
 
     const today = todayDate();
 
-    // Normalize last_daily safely
-    let lastDailyStr = null;
-    try {
-      if (user.last_daily) {
-        if (typeof user.last_daily === "string") lastDailyStr = user.last_daily.slice(0, 10);
-        else {
-          const d = new Date(user.last_daily);
-          if (!isNaN(d)) lastDailyStr = d.toISOString().slice(0, 10);
-        }
-      }
-    } catch (e) {
-      lastDailyStr = null;
-    }
-
-    if (lastDailyStr !== today) {
+    if (user.last_daily !== today) {
       const reward = Number(req.body.reward || 1000);
       const newBalance = Number(user.balance || 0) + reward;
 
@@ -636,9 +550,6 @@ app.post("/api/task", async (req, res) => {
     const state = await buildClientState(user);
     res.json(state);
   } catch (err) {
-    if (err && (err.code === "NEED_TELEGRAM" || String(err.message).includes("Missing Telegram user ID"))) {
-      return handleNeedTelegram(res);
-    }
     console.error("Error /api/task:", err);
     res.status(500).json({ ok: false, error: "TASK_ERROR" });
   }
@@ -651,9 +562,6 @@ app.post("/api/friends", async (req, res) => {
     const state = await buildClientState(user);
     res.json(state);
   } catch (err) {
-    if (err && (err.code === "NEED_TELEGRAM" || String(err.message).includes("Missing Telegram user ID"))) {
-      return handleNeedTelegram(res);
-    }
     console.error("Error /api/friends:", err);
     res.status(500).json({ ok: false, error: "FRIENDS_ERROR" });
   }
@@ -669,29 +577,35 @@ app.post("/api/withdraw/info", async (req, res) => {
       note: "Withdrawals not live yet; follow our Telegram channel.",
     });
   } catch (err) {
-    if (err && (err.code === "NEED_TELEGRAM" || String(err.message).includes("Missing Telegram user ID"))) {
-      return handleNeedTelegram(res);
-    }
     console.error("Error /api/withdraw/info:", err);
     res.status(500).json({ ok: false, error: "WITHDRAW_INFO_ERROR" });
   }
 });
 
-// ------------ Global leaderboard ------------
+// ------------ NEW: Global leaderboard ------------
+
 app.post("/api/leaderboard/global", async (req, res) => {
   try {
     let user = null;
     try {
       user = await getOrCreateUserFromInitData(req);
     } catch (e) {
-      // leaderboard can still return without user context
+      console.error("getOrCreateUserFromInitData failed in GLOBAL leaderboard:", e.message || e);
     }
 
-    const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
+    const limit = Math.max(
+      1,
+      Math.min(200, Number(req.body.limit || 100))
+    );
 
     const lbRes = await pool.query(
       `
-      SELECT telegram_id, username, first_name, last_name, balance
+      SELECT
+        telegram_id,
+        username,
+        first_name,
+        last_name,
+        balance
       FROM users
       ORDER BY balance DESC, telegram_id ASC
       LIMIT $1;
@@ -709,6 +623,7 @@ app.post("/api/leaderboard/global", async (req, res) => {
     }));
 
     let me = null;
+    let total = null;
     if (user && user.telegram_id) {
       const rankInfo = await getGlobalRankForUser(user);
       me = {
@@ -717,28 +632,46 @@ app.post("/api/leaderboard/global", async (req, res) => {
         global_rank: rankInfo.rank,
         global_total: rankInfo.total,
       };
+      total = rankInfo.total;
     }
 
-    res.json({ ok: true, me, global: rows });
+    res.json({
+      ok: true,
+      me,
+      global: rows,
+    });
   } catch (err) {
     console.error("Error /api/leaderboard/global:", err);
     res.status(500).json({ ok: false, error: "LEADERBOARD_GLOBAL_ERROR" });
   }
 });
 
-// ------------ Daily leaderboard (today_farmed) ------------
+
+
+// ------------ NEW: Daily leaderboard (today_farmed) ------------
 app.post("/api/leaderboard/daily", async (req, res) => {
   try {
     let user = null;
     try {
       user = await getOrCreateUserFromInitData(req);
-    } catch (e) {}
+    } catch (e) {
+      console.error("getOrCreateUserFromInitData failed in DAILY leaderboard:", e.message || e);
+    }
 
-    const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
+    const limit = Math.max(
+      1,
+      Math.min(200, Number(req.body.limit || 100))
+    );
 
+    // Top daily farmers by today_farmed
     const lbRes = await pool.query(
       `
-      SELECT telegram_id, username, first_name, last_name, today_farmed
+      SELECT
+        telegram_id,
+        username,
+        first_name,
+        last_name,
+        today_farmed
       FROM users
       ORDER BY today_farmed DESC, telegram_id ASC
       LIMIT $1;
@@ -755,12 +688,14 @@ app.post("/api/leaderboard/daily", async (req, res) => {
       daily_rank: idx + 1,
     }));
 
+    // Total players (for context)
     const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM users;`);
     const total = Number(totalRes.rows[0].count || 0);
 
     const myTid = user && user.telegram_id ? Number(user.telegram_id) : null;
-    let myRank = null;
 
+    // Compute my daily rank even if I'm not in the top N
+    let myRank = null;
     if (myTid !== null && total > 0) {
       const myRowRes = await pool.query(
         `SELECT today_farmed FROM users WHERE telegram_id = $1 LIMIT 1;`,
@@ -779,15 +714,14 @@ app.post("/api/leaderboard/daily", async (req, res) => {
 
     res.json({
       ok: true,
-      me:
-        myTid !== null
-          ? {
-              telegram_id: myTid,
-              today_farmed: Number(user.today_farmed || 0),
-              daily_rank: myRank,
-              daily_total: total,
-            }
-          : null,
+      me: myTid !== null
+        ? {
+            telegram_id: myTid,
+            today_farmed: Number(user.today_farmed || 0),
+            daily_rank: myRank,
+            daily_total: total,
+          }
+        : null,
       daily: rows,
     });
   } catch (err) {
@@ -796,16 +730,26 @@ app.post("/api/leaderboard/daily", async (req, res) => {
   }
 });
 
-// ------------ Friends leaderboard ------------
+
+// ------------ NEW: Friends leaderboard (you + referred friends) ------------
+
 app.post("/api/leaderboard/friends", async (req, res) => {
   try {
     let user = null;
     try {
       user = await getOrCreateUserFromInitData(req);
-    } catch (e) {}
+    } catch (e) {
+      console.error("getOrCreateUserFromInitData failed in FRIENDS leaderboard:", e.message || e);
+    }
 
     if (!user || !user.telegram_id) {
-      return res.json({ ok: true, me: null, friends: [], overtake: null });
+      // No user context -> return empty friends list but keep request successful
+      return res.json({
+        ok: true,
+        me: null,
+        friends: [],
+        overtake: null,
+      });
     }
 
     const myTid = Number(user.telegram_id);
@@ -827,7 +771,8 @@ app.post("/api/leaderboard/friends", async (req, res) => {
       .map((r) => Number(r.friend_id))
       .filter((v) => !!v && v !== myTid);
 
-    const idsForQuery = friendIds.length > 0 ? [...friendIds, myTid] : [myTid];
+    const idsForQuery =
+      friendIds.length > 0 ? [...friendIds, myTid] : [myTid];
 
     const usersRes = await pool.query(
       `
@@ -847,7 +792,10 @@ app.post("/api/leaderboard/friends", async (req, res) => {
         balance: Number(r.balance || 0),
       }))
       .sort((a, b) => b.balance - a.balance || a.telegram_id - b.telegram_id)
-      .map((r, idx) => ({ ...r, friend_rank: idx + 1 }));
+      .map((r, idx) => ({
+        ...r,
+        friend_rank: idx + 1,
+      }));
 
     const meEntry = list.find((x) => x.telegram_id === myTid) || null;
 
@@ -863,12 +811,18 @@ app.post("/api/leaderboard/friends", async (req, res) => {
       }
     }
 
-    res.json({ ok: true, me: meEntry, friends: list, overtake });
+    res.json({
+      ok: true,
+      me: meEntry,
+      friends: list,
+      overtake,
+    });
   } catch (err) {
     console.error("Error /api/leaderboard/friends:", err);
     res.status(500).json({ ok: false, error: "LEADERBOARD_FRIENDS_ERROR" });
   }
 });
+
 // ------------ Telegram Bot Handlers ------------
 
 // /start – handle possible referral
@@ -918,7 +872,9 @@ bot.start(async (ctx) => {
       const startPayload = ctx.startPayload;
       if (startPayload) {
         let payload = startPayload;
-        if (payload.startsWith("ref_")) payload = payload.slice(4);
+        if (payload.startsWith("ref_")) {
+          payload = payload.slice(4);
+        }
         const inviterId = Number(payload);
 
         if (inviterId && inviterId !== telegramId) {
@@ -962,18 +918,23 @@ bot.start(async (ctx) => {
       client.release();
     }
 
-    await ctx.reply("🔥 Welcome to Airdrop Empire!\n\nTap below to open the game 👇", {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "🚀 Open Airdrop Empire",
-              web_app: { url: WEB_APP_URL },
-            },
+    await ctx.reply(
+      "🔥 Welcome to Airdrop Empire!\n\nTap below to open the game 👇",
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "🚀 Open Airdrop Empire",
+                web_app: {
+                  url: "https://resilient-kheer-041b8c.netlify.app",
+                },
+              },
+            ],
           ],
-        ],
-      },
-    });
+        },
+      }
+    );
   } catch (err) {
     console.error("Error in /start handler:", err);
     await ctx.reply("Something went wrong. Please try again later.");
@@ -982,7 +943,9 @@ bot.start(async (ctx) => {
 
 // Simple commands for debugging
 bot.command("tasks", async (ctx) => {
-  await ctx.reply("✨ Daily tasks coming soon.\nWe will add partner quests, socials & more.");
+  await ctx.reply(
+    "✨ Daily tasks coming soon.\nWe will add partner quests, socials & more."
+  );
 });
 
 bot.command("tap", async (ctx) => {
@@ -994,7 +957,9 @@ bot.command("tap", async (ctx) => {
           [
             {
               text: "🚀 Open Airdrop Empire",
-              web_app: { url: WEB_APP_URL },
+              web_app: {
+                url: "https://resilient-kheer-041b8c.netlify.app",
+              },
             },
           ],
         ],
@@ -1011,35 +976,16 @@ bot.command("referral", async (ctx) => {
   );
 });
 
-// ------------ Launch (409-safe bot startup) ------------
+// ------------ Launch ------------
 async function start() {
   const PORT = process.env.PORT || 3000;
 
   app.listen(PORT, () => {
     console.log(`🌐 Express API running on port ${PORT}`);
-    console.log(`✅ WEB_APP_URL = ${WEB_APP_URL}`);
-    console.log(`✅ FRONTEND_ORIGIN = ${FRONTEND_ORIGIN}`);
   });
 
-  try {
-    await bot.launch();
-    console.log("🤖 Telegram bot launched as @%s", BOT_USERNAME);
-  } catch (err) {
-    // ✅ Prevent Render crashing if another bot instance is polling
-    if (
-      (err && err.code === 409) ||
-      (err && err.response && err.response.error_code === 409) ||
-      String(err).includes("409")
-    ) {
-      console.error(
-        "⚠️ TelegramError 409: another getUpdates is already running. " +
-          "Bot polling disabled for this instance, API will still work."
-      );
-    } else {
-      console.error("Fatal bot launch error:", err);
-      process.exit(1);
-    }
-  }
+  await bot.launch();
+  console.log("🤖 Telegram bot launched as @%s", BOT_USERNAME);
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
