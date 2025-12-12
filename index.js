@@ -49,6 +49,157 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ------------ NEW: one-time schema init (prevents repeat DDL + race conditions) ------------
+let __schemaInitPromise = null;
+
+async function ensureSchema(client) {
+  if (__schemaInitPromise) return __schemaInitPromise;
+
+  __schemaInitPromise = (async () => {
+    // ---------- Core tables ----------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.users (
+        id SERIAL PRIMARY KEY,
+        telegram_id BIGINT UNIQUE,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        language_code TEXT,
+        balance BIGINT DEFAULT 0,
+        energy INT DEFAULT 50,
+        max_energy INT DEFAULT 50,
+        today_farmed BIGINT DEFAULT 0,
+        last_daily DATE,
+        last_reset DATE,
+        last_energy_ts TIMESTAMPTZ,
+        taps_today INT DEFAULT 0,
+        referrals_count BIGINT DEFAULT 0,
+        referrals_points BIGINT DEFAULT 0,
+        double_boost_until TIMESTAMPTZ
+      );
+    `);
+
+    // Ensure columns exist (safe on existing DB)
+    await client.query(`
+      ALTER TABLE public.users
+      ADD COLUMN IF NOT EXISTS telegram_id BIGINT,
+      ADD COLUMN IF NOT EXISTS username TEXT,
+      ADD COLUMN IF NOT EXISTS first_name TEXT,
+      ADD COLUMN IF NOT EXISTS last_name TEXT,
+      ADD COLUMN IF NOT EXISTS language_code TEXT,
+      ADD COLUMN IF NOT EXISTS balance BIGINT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS energy INT DEFAULT 50,
+      ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
+      ADD COLUMN IF NOT EXISTS today_farmed BIGINT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_daily DATE,
+      ADD COLUMN IF NOT EXISTS last_reset DATE,
+      ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS taps_today INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS referrals_count BIGINT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS referrals_points BIGINT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS double_boost_until TIMESTAMPTZ;
+    `);
+
+    // Uniqueness for telegram_id (index is safest vs constraint name collisions)
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS users_telegram_id_unique
+      ON public.users (telegram_id);
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.referrals (
+        id SERIAL PRIMARY KEY,
+        inviter_id BIGINT NOT NULL,
+        invited_id BIGINT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE (inviter_id, invited_id)
+      );
+    `);
+
+    // ---------- Missions ----------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.missions (
+        id SERIAL PRIMARY KEY,
+        description TEXT,
+        payout_type TEXT,
+        payout_amount BIGINT,
+        url TEXT,
+        kind TEXT,
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    // Align missions with your new columns (code + title) and required defaults
+    await client.query(`
+      ALTER TABLE public.missions
+      ADD COLUMN IF NOT EXISTS code TEXT,
+      ADD COLUMN IF NOT EXISTS title TEXT,
+      ADD COLUMN IF NOT EXISTS description TEXT,
+      ADD COLUMN IF NOT EXISTS payout_type TEXT,
+      ADD COLUMN IF NOT EXISTS payout_amount BIGINT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS url TEXT,
+      ADD COLUMN IF NOT EXISTS kind TEXT,
+      ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+    `);
+
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS missions_code_unique
+      ON public.missions (code);
+    `);
+
+    // ---------- User Missions ----------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.user_missions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+        mission_id INTEGER NOT NULL REFERENCES public.missions(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'started',
+        started_at TIMESTAMPTZ DEFAULT NOW(),
+        completed_at TIMESTAMPTZ,
+        verified_at TIMESTAMPTZ,
+        reward_applied BOOLEAN DEFAULT FALSE,
+        UNIQUE (user_id, mission_id)
+      );
+    `);
+
+    // ---------- Ad sessions ----------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.ad_sessions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+        network TEXT,
+        reward_type TEXT NOT NULL,
+        reward_amount BIGINT DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        completed_at TIMESTAMPTZ
+      );
+    `);
+
+    // Indexes
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_balance
+      ON public.users (balance DESC);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_today
+      ON public.users (today_farmed DESC);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_user_missions_user
+      ON public.user_missions (user_id);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_ad_sessions_user
+      ON public.ad_sessions (user_id);
+    `);
+  })();
+
+  return __schemaInitPromise;
+}
+
 // ------------ Mini-app auth helper ------------
 function parseInitData(initDataRaw) {
   if (!initDataRaw) return {};
@@ -99,110 +250,12 @@ async function getOrCreateUserFromInitData(req) {
 
   const client = await pool.connect();
   try {
-    // ---------- Core tables ----------
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        telegram_id BIGINT UNIQUE NOT NULL,
-        username TEXT,
-        first_name TEXT,
-        last_name TEXT,
-        language_code TEXT,
-        balance BIGINT DEFAULT 0,
-        energy INT DEFAULT 50,
-        max_energy INT DEFAULT 50,
-        today_farmed BIGINT DEFAULT 0,
-        last_daily DATE,
-        last_reset DATE,
-        last_energy_ts TIMESTAMPTZ,
-        taps_today INT DEFAULT 0,
-        referrals_count BIGINT DEFAULT 0,
-        referrals_points BIGINT DEFAULT 0,
-        double_boost_until TIMESTAMPTZ
-      );
-    `);
-
-    await client.query(`
-      ALTER TABLE users
-      ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
-      ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS double_boost_until TIMESTAMPTZ;
-    `);
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS referrals (
-        id SERIAL PRIMARY KEY,
-        inviter_id BIGINT NOT NULL,
-        invited_id BIGINT NOT NULL,
-        created_at TIMESTAMP DEFAULT NOW(),
-        UNIQUE (inviter_id, invited_id)
-      );
-    `);
-
-    // ---------- NEW: Missions + Ad sessions ----------
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS missions (
-        id SERIAL PRIMARY KEY,
-        code TEXT UNIQUE NOT NULL,
-        title TEXT NOT NULL,
-        description TEXT,
-        payout_type TEXT NOT NULL,       -- 'points', 'energy_refill', 'double_10m'
-        payout_amount BIGINT DEFAULT 0,  -- used for 'points' (and for future flexible rewards)
-        url TEXT,
-        kind TEXT,                       -- 'ad', 'social', 'offerwall', 'pro'
-        is_active BOOLEAN DEFAULT TRUE,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS user_missions (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        mission_id INTEGER NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-        status TEXT NOT NULL DEFAULT 'started',  -- 'started', 'completed', 'verified'
-        started_at TIMESTAMPTZ DEFAULT NOW(),
-        completed_at TIMESTAMPTZ,
-        verified_at TIMESTAMPTZ,
-        reward_applied BOOLEAN DEFAULT FALSE,
-        UNIQUE (user_id, mission_id)
-      );
-    `);
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS ad_sessions (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        network TEXT,
-        reward_type TEXT NOT NULL,       -- 'points', 'energy_refill', 'double_10m'
-        reward_amount BIGINT DEFAULT 0,  -- for 'points'; optional for others
-        status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'completed'
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        completed_at TIMESTAMPTZ
-      );
-    `);
-
-    // Basic indexes to make leaderboards & lookups faster
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_users_balance
-      ON users (balance DESC);
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_users_today
-      ON users (today_farmed DESC);
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_user_missions_user
-      ON user_missions (user_id);
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_ad_sessions_user
-      ON ad_sessions (user_id);
-    `);
+    // ✅ schema init once (safe)
+    await ensureSchema(client);
 
     // Upsert user
     const existing = await client.query(
-      `SELECT * FROM users WHERE telegram_id = $1 LIMIT 1;`,
+      `SELECT * FROM public.users WHERE telegram_id = $1 LIMIT 1;`,
       [telegramUserId]
     );
 
@@ -210,7 +263,7 @@ async function getOrCreateUserFromInitData(req) {
     if (existing.rowCount === 0) {
       const insertRes = await client.query(
         `
-        INSERT INTO users (
+        INSERT INTO public.users (
           telegram_id,
           username,
           first_name,
@@ -275,7 +328,7 @@ async function applyEnergyRegen(user) {
 
   await pool.query(
     `
-    UPDATE users
+    UPDATE public.users
     SET energy = $1,
         last_energy_ts = NOW()
     WHERE id = $2
@@ -288,7 +341,6 @@ async function applyEnergyRegen(user) {
 
   return user;
 }
-
 // ------------ Daily reset logic ------------
 async function ensureDailyReset(user) {
   const today = todayDate();
@@ -312,7 +364,7 @@ async function ensureDailyReset(user) {
 
   const updated = await pool.query(
     `
-      UPDATE users
+      UPDATE public.users
       SET today_farmed = 0,
           taps_today = 0,
           energy = max_energy,
@@ -351,7 +403,7 @@ async function handleTap(user) {
 
   const updated = await pool.query(
     `
-    UPDATE users
+    UPDATE public.users
     SET balance = $1,
         energy = $2,
         today_farmed = $3,
@@ -369,7 +421,7 @@ async function handleTap(user) {
 async function getGlobalRankForUser(user) {
   const balance = Number(user.balance || 0);
 
-  const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM users;`);
+  const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM public.users;`);
   const total = Number(totalRes.rows[0].count);
 
   if (total === 0) return { rank: null, total: 0 };
@@ -377,7 +429,7 @@ async function getGlobalRankForUser(user) {
   const aboveRes = await pool.query(
     `
     SELECT COUNT(*) AS count
-    FROM users
+    FROM public.users
     WHERE balance > $1;
     `,
     [balance]
@@ -432,7 +484,7 @@ async function applyGenericReward(user, rewardType, rewardAmount) {
   if (type === "points" && amount > 0) {
     const res = await pool.query(
       `
-      UPDATE users
+      UPDATE public.users
       SET balance = balance + $1
       WHERE id = $2
       RETURNING *;
@@ -443,7 +495,7 @@ async function applyGenericReward(user, rewardType, rewardAmount) {
   } else if (type === "energy_refill") {
     const res = await pool.query(
       `
-      UPDATE users
+      UPDATE public.users
       SET energy = max_energy,
           last_energy_ts = NOW()
       WHERE id = $1
@@ -464,7 +516,7 @@ async function applyGenericReward(user, rewardType, rewardAmount) {
 
     const res = await pool.query(
       `
-      UPDATE users
+      UPDATE public.users
       SET double_boost_until = $1
       WHERE id = $2
       RETURNING *;
@@ -594,7 +646,7 @@ app.post("/api/tap", async (req, res) => {
 
     const upd = await pool.query(
       `
-      UPDATE users
+      UPDATE public.users
       SET balance        = $1,
           energy         = $2,
           today_farmed   = $3,
@@ -614,7 +666,6 @@ app.post("/api/tap", async (req, res) => {
     res.status(500).json({ ok: false, error: "TAP_ERROR" });
   }
 });
-
 // Energy boost – refill energy via action or by spending points (hybrid)
 app.post("/api/boost/energy", async (req, res) => {
   try {
@@ -650,7 +701,7 @@ app.post("/api/boost/energy", async (req, res) => {
 
       const upd = await pool.query(
         `
-        UPDATE users
+        UPDATE public.users
         SET balance        = balance - $1,
             energy         = max_energy,
             last_energy_ts = NOW()
@@ -663,7 +714,7 @@ app.post("/api/boost/energy", async (req, res) => {
     } else {
       const upd = await pool.query(
         `
-        UPDATE users
+        UPDATE public.users
         SET energy         = max_energy,
             last_energy_ts = NOW()
         WHERE id = $1
@@ -713,7 +764,7 @@ app.post("/api/boost/double", async (req, res) => {
 
       const upd = await pool.query(
         `
-        UPDATE users
+        UPDATE public.users
         SET balance = balance - $1,
             double_boost_until =
               GREATEST(COALESCE(double_boost_until, NOW()), NOW()) + INTERVAL '10 minutes'
@@ -727,7 +778,7 @@ app.post("/api/boost/double", async (req, res) => {
       // "action" path – free sponsor-based boost
       const upd = await pool.query(
         `
-        UPDATE users
+        UPDATE public.users
         SET double_boost_until =
               GREATEST(COALESCE(double_boost_until, NOW()), NOW()) + INTERVAL '10 minutes'
         WHERE id = $1
@@ -774,7 +825,7 @@ app.post("/api/mission/list", async (req, res) => {
     const missionsRes = await pool.query(
       `
       SELECT id, code, title, description, payout_type, payout_amount, url, kind
-      FROM missions
+      FROM public.missions
       ${where}
       ORDER BY id ASC;
       `,
@@ -787,7 +838,7 @@ app.post("/api/mission/list", async (req, res) => {
       const umRes = await pool.query(
         `
         SELECT mission_id, status, reward_applied
-        FROM user_missions
+        FROM public.user_missions
         WHERE user_id = $1 AND mission_id = ANY($2::int[]);
         `,
         [user.id, missionIds]
@@ -841,7 +892,7 @@ app.post("/api/mission/start", async (req, res) => {
     const missionRes = await pool.query(
       `
       SELECT *
-      FROM missions
+      FROM public.missions
       WHERE code = $1 AND is_active = TRUE
       LIMIT 1;
       `,
@@ -858,12 +909,12 @@ app.post("/api/mission/start", async (req, res) => {
 
     await pool.query(
       `
-      INSERT INTO user_missions (user_id, mission_id, status, started_at)
+      INSERT INTO public.user_missions (user_id, mission_id, status, started_at)
       VALUES ($1, $2, 'started', NOW())
       ON CONFLICT (user_id, mission_id)
       DO UPDATE SET
         status = 'started',
-        started_at = COALESCE(user_missions.started_at, NOW());
+        started_at = COALESCE(public.user_missions.started_at, NOW());
       `,
       [user.id, mission.id]
     );
@@ -894,7 +945,7 @@ app.post("/api/mission/complete", async (req, res) => {
     const missionRes = await pool.query(
       `
       SELECT *
-      FROM missions
+      FROM public.missions
       WHERE code = $1
       LIMIT 1;
       `,
@@ -909,12 +960,12 @@ app.post("/api/mission/complete", async (req, res) => {
 
     const umRes = await pool.query(
       `
-      INSERT INTO user_missions (user_id, mission_id, status, started_at, completed_at)
+      INSERT INTO public.user_missions (user_id, mission_id, status, started_at, completed_at)
       VALUES ($1, $2, 'completed', NOW(), NOW())
       ON CONFLICT (user_id, mission_id)
       DO UPDATE SET
         status = 'completed',
-        completed_at = COALESCE(user_missions.completed_at, NOW())
+        completed_at = COALESCE(public.user_missions.completed_at, NOW())
       RETURNING *;
       `,
       [user.id, mission.id]
@@ -927,7 +978,7 @@ app.post("/api/mission/complete", async (req, res) => {
 
       await pool.query(
         `
-        UPDATE user_missions
+        UPDATE public.user_missions
         SET reward_applied = TRUE,
             verified_at = NOW()
         WHERE id = $1;
@@ -970,7 +1021,7 @@ app.post("/api/boost/requestAd", async (req, res) => {
 
     const adRes = await pool.query(
       `
-      INSERT INTO ad_sessions (user_id, network, reward_type, reward_amount, status)
+      INSERT INTO public.ad_sessions (user_id, network, reward_type, reward_amount, status)
       VALUES ($1, $2, $3, $4, 'pending')
       RETURNING id, reward_type, reward_amount;
       `,
@@ -1004,7 +1055,7 @@ app.post("/api/boost/completeAd", async (req, res) => {
     const adRes = await pool.query(
       `
       SELECT *
-      FROM ad_sessions
+      FROM public.ad_sessions
       WHERE id = $1 AND user_id = $2 AND status = 'pending'
       LIMIT 1;
       `,
@@ -1024,7 +1075,7 @@ app.post("/api/boost/completeAd", async (req, res) => {
 
     await pool.query(
       `
-      UPDATE ad_sessions
+      UPDATE public.ad_sessions
       SET status = 'completed',
           completed_at = NOW()
       WHERE id = $1;
@@ -1080,7 +1131,7 @@ app.post("/api/task", async (req, res) => {
 
       const upd = await pool.query(
         `
-        UPDATE users
+        UPDATE public.users
         SET balance = $1,
             last_daily = $2
         WHERE id = $3
@@ -1150,7 +1201,7 @@ app.post("/api/leaderboard/global", async (req, res) => {
         first_name,
         last_name,
         balance
-      FROM users
+      FROM public.users
       ORDER BY balance DESC, telegram_id ASC
       LIMIT $1;
     `,
@@ -1211,7 +1262,7 @@ app.post("/api/leaderboard/daily", async (req, res) => {
         first_name,
         last_name,
         today_farmed
-      FROM users
+      FROM public.users
       ORDER BY today_farmed DESC, telegram_id ASC
       LIMIT $1;
     `,
@@ -1227,7 +1278,7 @@ app.post("/api/leaderboard/daily", async (req, res) => {
       daily_rank: idx + 1,
     }));
 
-    const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM users;`);
+    const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM public.users;`);
     const total = Number(totalRes.rows[0].count || 0);
 
     const myTid = user && user.telegram_id ? Number(user.telegram_id) : null;
@@ -1235,13 +1286,13 @@ app.post("/api/leaderboard/daily", async (req, res) => {
     let myRank = null;
     if (myTid !== null && total > 0) {
       const myRowRes = await pool.query(
-        `SELECT today_farmed FROM users WHERE telegram_id = $1 LIMIT 1;`,
+        `SELECT today_farmed FROM public.users WHERE telegram_id = $1 LIMIT 1;`,
         [myTid]
       );
       if (myRowRes.rowCount > 0) {
         const myToday = Number(myRowRes.rows[0].today_farmed || 0);
         const aboveRes = await pool.query(
-          `SELECT COUNT(*) AS count FROM users WHERE today_farmed > $1;`,
+          `SELECT COUNT(*) AS count FROM public.users WHERE today_farmed > $1;`,
           [myToday]
         );
         const countAbove = Number(aboveRes.rows[0].count || 0);
@@ -1299,7 +1350,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
           WHEN inviter_id = $1 THEN invited_id
           WHEN invited_id = $1 THEN inviter_id
         END AS friend_id
-      FROM referrals
+      FROM public.referrals
       WHERE inviter_id = $1 OR invited_id = $1;
     `,
       [myTid]
@@ -1314,7 +1365,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
     const usersRes = await pool.query(
       `
       SELECT telegram_id, username, first_name, last_name, balance
-      FROM users
+      FROM public.users
       WHERE telegram_id = ANY($1::bigint[]);
     `,
       [idsForQuery]
@@ -1374,10 +1425,13 @@ bot.start(async (ctx) => {
     try {
       await client.query("BEGIN");
 
+      // ✅ ensure schema exists before bot writes
+      await ensureSchema(client);
+
       let res = await client.query(
         `
         SELECT *
-        FROM users
+        FROM public.users
         WHERE telegram_id = $1
         LIMIT 1;
       `,
@@ -1388,7 +1442,7 @@ bot.start(async (ctx) => {
       if (res.rowCount === 0) {
         const insertRes = await client.query(
           `
-          INSERT INTO users (
+          INSERT INTO public.users (
             telegram_id,
             username,
             first_name,
@@ -1417,7 +1471,7 @@ bot.start(async (ctx) => {
           const refRes = await client.query(
             `
             SELECT *
-            FROM referrals
+            FROM public.referrals
             WHERE inviter_id = $1 AND invited_id = $2;
           `,
             [inviterId, telegramId]
@@ -1426,7 +1480,7 @@ bot.start(async (ctx) => {
           if (refRes.rowCount === 0) {
             await client.query(
               `
-              INSERT INTO referrals (inviter_id, invited_id)
+              INSERT INTO public.referrals (inviter_id, invited_id)
               VALUES ($1, $2);
             `,
               [inviterId, telegramId]
@@ -1434,7 +1488,7 @@ bot.start(async (ctx) => {
 
             await client.query(
               `
-              UPDATE users
+              UPDATE public.users
               SET balance = balance + $1,
                   referrals_count = referrals_count + 1,
                   referrals_points = referrals_points + $1
