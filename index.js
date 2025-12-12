@@ -1,3 +1,4 @@
+let botRunning = false;
 // index.js
 // Airdrop Empire – Backend Engine (leaderboards + referrals + tasks)
 //
@@ -5,6 +6,44 @@
 
 const express = require("express");
 const cors = require("cors");
+
+const crypto = require("crypto");
+
+function parseInitData(initData) {
+  try {
+    const params = new URLSearchParams(initData);
+    const data = {};
+    for (const [k, v] of params.entries()) data[k] = v;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function validateTelegramWebAppInitData(initData, botToken) {
+  // Telegram WebApp initData validation
+  // https://core.telegram.org/bots/webapps#validating-data-received-via-the-web-app
+  const data = parseInitData(initData);
+  if (!data || !data.hash) return false;
+
+  const hash = data.hash;
+  delete data.hash;
+
+  const keys = Object.keys(data).sort();
+  const dataCheckString = keys.map(k => `${k}=${data[k]}`).join("\n");
+
+  const secretKey = crypto.createHmac("sha256", "WebAppData").update(botToken).digest();
+  const hmac = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
+
+  return hmac === hash;
+}
+
+function getTelegramUserFromInitData(initData) {
+  const data = parseInitData(initData);
+  if (!data || !data.user) return null;
+  try { return JSON.parse(data.user); } catch { return null; }
+}
+
 const { Telegraf } = require("telegraf");
 const { Pool } = require("pg");
 
@@ -12,6 +51,12 @@ const { Pool } = require("pg");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const BOT_USERNAME = process.env.BOT_USERNAME || "AirdropEmpireAppBot";
+
+
+const WEB_APP_URL = process.env.WEB_APP_URL || "${WEB_APP_URL}";
+const ALLOW_DEV_FALLBACK = process.env.ALLOW_DEV_FALLBACK === "1";
+const MIN_TAP_INTERVAL_MS = parseInt(process.env.MIN_TAP_INTERVAL_MS || "200", 10);
+
 
 // Render / scaling safe: set DISABLE_BOT_POLLING=1 to stop 409 conflicts
 const DISABLE_BOT_POLLING = String(process.env.DISABLE_BOT_POLLING || "").trim() === "1";
@@ -48,6 +93,24 @@ const DOUBLE_BOOST_COST = 1000;
 // ------------ Bot & Express Setup ------------
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
+
+
+function getTelegramIdFromRequest(req) {
+  const initData = req.body?.initData || req.headers["x-telegram-init-data"];
+  if (initData && process.env.BOT_TOKEN) {
+    if (!validateTelegramWebAppInitData(initData, process.env.BOT_TOKEN)) {
+      return { ok: false, status: 401, reason: "BAD_INIT_DATA" };
+    }
+    const user = getTelegramUserFromInitData(initData);
+    if (!user?.id) return { ok: false, status: 401, reason: "NO_USER_IN_INIT_DATA" };
+    return { ok: true, telegramId: String(user.id) };
+  }
+
+  const fallback = req.body?.telegram_id || req.query?.telegram_id;
+  if (fallback && ALLOW_DEV_FALLBACK) return { ok: true, telegramId: String(fallback) };
+
+  return { ok: false, status: 401, reason: "AUTH_REQUIRED" };
+}
 
 app.use(cors());
 app.use(express.json());
@@ -484,6 +547,11 @@ app.get("/", (req, res) => {
 
 // State route – sync for mini app
 app.post("/api/state", async (req, res) => {
+const auth = getTelegramIdFromRequest(req);
+if (!auth.ok) return res.status(auth.status).json({ ok:false, reason: auth.reason });
+const telegram_id = auth.telegramId;
+
+
   try {
     let user = await getOrCreateUserFromInitData(req);
 
@@ -543,6 +611,11 @@ app.get("/api/state-debug", async (req, res) => {
 
 // Tap route – regen + spend 1 energy + add points (x2 if boost)
 app.post("/api/tap", async (req, res) => {
+const auth = getTelegramIdFromRequest(req);
+if (!auth.ok) return res.status(auth.status).json({ ok:false, reason: auth.reason });
+const telegram_id = auth.telegramId;
+
+
   try {
     let user = await getOrCreateUserFromInitData(req);
 
@@ -1442,7 +1515,7 @@ bot.start(async (ctx) => {
               {
                 text: "🚀 Open Airdrop Empire",
                 web_app: {
-                  url: "https://resilient-kheer-041b8c.netlify.app",
+                  url: "${WEB_APP_URL}",
                 },
               },
             ],
@@ -1473,7 +1546,7 @@ bot.command("tap", async (ctx) => {
             {
               text: "🚀 Open Airdrop Empire",
               web_app: {
-                url: "https://resilient-kheer-041b8c.netlify.app",
+                url: "${WEB_APP_URL}",
               },
             },
           ],
@@ -1503,7 +1576,7 @@ async function start() {
     console.log("🤖 Bot polling disabled (DISABLE_BOT_POLLING=1). API will still work.");
   } else {
     try {
-      await bot.launch();
+      await bot.launch().then(()=>{ botRunning = true; });
       console.log("🤖 Telegram bot launched as @%s", BOT_USERNAME);
     } catch (err) {
       if (
@@ -1522,8 +1595,8 @@ async function start() {
     }
   }
 
-  process.once("SIGINT", () => bot.stop("SIGINT"));
-  process.once("SIGTERM", () => bot.stop("SIGTERM"));
+  process.once("SIGINT", () => { try { if (botRunning) bot.stop("SIGINT"); } catch(e) {} });
+  process.once("SIGTERM", () => { try { if (botRunning) bot.stop("SIGTERM"); } catch(e) {} });
 }
 
 start().catch((err) => {
