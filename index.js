@@ -36,6 +36,13 @@ function todayDate() {
   return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
 }
 
+// Seconds until next UTC day (for countdown)
+function secondsUntilNextUtcMidnight() {
+  const now = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0));
+  return Math.max(0, Math.floor((next - now) / 1000));
+}
+
 // Referral reward per new friend (once, when they join)
 const REFERRAL_REWARD = 800;
 
@@ -44,6 +51,9 @@ const ENERGY_REFILL_COST = 500;
 
 // Cost (in points) for paid double-points boost (10 mins)
 const DOUBLE_BOOST_COST = 1000;
+
+// Daily check-in reward (fixed)
+const DAILY_CHECKIN_REWARD = 500;
 
 // ------------ Bot & Express Setup ------------
 const bot = new Telegraf(BOT_TOKEN);
@@ -606,6 +616,7 @@ app.post("/api/tap", async (req, res) => {
     res.status(500).json({ ok: false, error: "TAP_ERROR" });
   }
 });
+
 // Energy boost – refill energy via action or by spending points (hybrid)
 app.post("/api/boost/energy", async (req, res) => {
   try {
@@ -1036,14 +1047,25 @@ app.post("/api/boost/completeAd", async (req, res) => {
   }
 });
 
-// Daily task route (simple daily + backend sync, FIXED one-claim-per-day)
+// Daily task route – DAILY CHECK-IN (24h cooldown, fixed +500, explicit response)
 app.post("/api/task", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
-    const taskName = req.body.taskName;
 
-    if (!taskName) {
-      return res.status(400).json({ ok: false, error: "MISSING_TASK_NAME" });
+    const taskNameRaw = req.body.taskName || "";
+    const taskName = String(taskNameRaw).trim().toLowerCase();
+
+    // Accept a couple of likely frontend variants
+    const isDaily =
+      taskName === "daily_checkin" ||
+      taskName === "daily-checkin" ||
+      taskName === "daily" ||
+      taskName === "daily_check_in" ||
+      taskName === "checkin" ||
+      taskName === "check_in";
+
+    if (!isDaily) {
+      return res.json({ ok: false, reason: "UNKNOWN_TASK" });
     }
 
     const today = todayDate(); // "YYYY-MM-DD"
@@ -1064,26 +1086,41 @@ app.post("/api/task", async (req, res) => {
       lastDailyStr = null;
     }
 
-    // Only reward if today is different from last_daily
-    if (lastDailyStr !== today) {
-      const reward = Number(req.body.reward || 1000);
-      const newBalance = Number(user.balance || 0) + reward;
-
-      const upd = await pool.query(
-        `
-        UPDATE public.users
-        SET balance = $1,
-            last_daily = $2
-        WHERE id = $3
-        RETURNING *;
-        `,
-        [newBalance, today, user.id]
-      );
-      user = upd.rows[0];
+    // Already claimed today → return explicit cooldown
+    if (lastDailyStr === today) {
+      const state = await buildClientState(user);
+      return res.json({
+        ...state,
+        ok: false,
+        reason: "ALREADY_CLAIMED",
+        next_claim_in_seconds: secondsUntilNextUtcMidnight(),
+      });
     }
 
+    // Apply +500 and mark claimed for today (DATE column)
+    const newBalance = Number(user.balance || 0) + DAILY_CHECKIN_REWARD;
+
+    const upd = await pool.query(
+      `
+      UPDATE public.users
+      SET balance = $1,
+          last_daily = $2
+      WHERE id = $3
+      RETURNING *;
+      `,
+      [newBalance, today, user.id]
+    );
+
+    user = upd.rows[0];
     const state = await buildClientState(user);
-    res.json(state);
+
+    return res.json({
+      ...state,
+      ok: true,
+      reward: DAILY_CHECKIN_REWARD,
+      message: "🔥 Daily check-in claimed!",
+      next_claim_in_seconds: secondsUntilNextUtcMidnight(),
+    });
   } catch (err) {
     console.error("Error /api/task:", err);
     res.status(500).json({ ok: false, error: "TASK_ERROR" });
