@@ -1,0 +1,1 @@
+# JIGCOIN-bot
