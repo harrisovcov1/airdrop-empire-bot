@@ -1,1 +1,0 @@
-# airdrop-empire-bot
