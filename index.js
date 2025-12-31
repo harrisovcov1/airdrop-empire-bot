@@ -1481,7 +1481,8 @@ async function getOrCreateUserFromInitData(req) {
           } catch (e) {
             console.error('team_earnings/referral_tree insert error (non-fatal):', e);
           }
- (no direct balance mutation here)
+ // (no direct balance mutation here)
+          
           await client.query(
             `
             UPDATE public.users
